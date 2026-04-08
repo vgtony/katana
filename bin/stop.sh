@@ -51,7 +51,7 @@ if [[ ${running_slices} != "[]" && ${running_slices} != "" ]]; then
 fi
 
 # Stop the containers
-docker-compose -f ${DIR}/docker-compose.yaml down ${options}
+docker compose -f "${DIR}/docker-compose.yaml" down ${options}
 
 # Remove the katana-log files
 rm -f katana-nbi/katana.log* katana-mngr/katana.log*

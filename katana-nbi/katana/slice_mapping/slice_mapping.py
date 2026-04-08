@@ -51,6 +51,37 @@ TEST_DES_OBJ = ("performance_monitoring", "performance_prediction")
 TEST_DES_LIST = ("probe_list",)
 
 
+def validate_nest_request(req):
+    if not isinstance(req, dict):
+        return "Error: Request body must be a JSON object", 400
+
+    base_slice_descriptor = req.get("base_slice_descriptor")
+    if base_slice_descriptor is None:
+        logger.error("Required field base_slice_descriptor is missing")
+        return "Error: Required field base_slice_descriptor is missing", 400
+    if not isinstance(base_slice_descriptor, dict):
+        logger.error("Field base_slice_descriptor must be a JSON object")
+        return "Error: Field 'base_slice_descriptor' must be a JSON object", 400
+
+    for field in ("service_descriptor", "test_descriptor"):
+        if req.get(field) is not None and not isinstance(req[field], dict):
+            logger.error(f"Field {field} must be a JSON object")
+            return f"Error: Field '{field}' must be a JSON object", 400
+
+    if (
+        "network_DL_throughput" in base_slice_descriptor
+        and base_slice_descriptor["network_DL_throughput"] is not None
+        and not isinstance(base_slice_descriptor["network_DL_throughput"], dict)
+    ):
+        logger.error("Field base_slice_descriptor.network_DL_throughput must be a JSON object")
+        return (
+            "Error: Field 'base_slice_descriptor.network_DL_throughput' must be a JSON object",
+            400,
+        )
+
+    return None
+
+
 # Calculate the Required generation
 def calc_find_data(gen, location, func):
     """
@@ -67,6 +98,9 @@ def nest_mapping(req):
     """
     Function that maps nest to the underlying network functions
     """
+    validation_error = validate_nest_request(req)
+    if validation_error:
+        return validation_error
 
     # Store the gst in DB
     mongoUtils.add("gst", req)
@@ -74,11 +108,7 @@ def nest_mapping(req):
     nest = {"_id": req["_id"]}
 
     # Check if the base_slice_des_ref or the required fields are set
-    try:
-        base_slice_des_ref = req["base_slice_descriptor"].get("base_slice_des_ref", None)
-    except KeyError:
-        logger.error("Required field base_slice_descriptor is missing")
-        return ("Error: Required field base_slice_descriptor is missing", 400)
+    base_slice_des_ref = req["base_slice_descriptor"].get("base_slice_des_ref", None)
     if not base_slice_des_ref:
         for req_key in REQ_FIELDS:
             if req_key not in req["base_slice_descriptor"]:

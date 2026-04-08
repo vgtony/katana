@@ -28,6 +28,20 @@ class FunctionView(FlaskView):
     route_prefix = "/api/"
     req_fields = ["id", "gen", "func", "shared", "type", "location"]
 
+    def _validate_function_payload(self, data):
+        if not isinstance(data, dict):
+            return "Error: Request body must be a JSON object", 400
+
+        for field in self.req_fields:
+            if field not in data:
+                return f"Error: Required fields: {self.req_fields}", 400
+
+        if not isinstance(data["shared"], dict):
+            return "Error: Field 'shared' must be a JSON object", 400
+
+        data["shared"].setdefault("sharing_list", {})
+        return None
+
     def index(self):
         """
         Returns a list of supported functions and their details,
@@ -63,21 +77,17 @@ class FunctionView(FlaskView):
         used by: `katana func add -f [file]`
         """
         new_uuid = str(uuid.uuid4())
-        data = request.json
+        data = request.get_json(silent=True) or {}
         data["_id"] = new_uuid
         data["created_at"] = time.time()  # unix epoch
         data["tenants"] = []
-        data["shared"]["sharing_list"] = {}
-
-        for field in self.req_fields:
-            try:
-                _ = data[field]
-            except KeyError:
-                return f"Error: Required fields: {self.req_fields}", 400
+        validation_error = self._validate_function_payload(data)
+        if validation_error:
+            return validation_error
 
         # Check that the Function location is registered
-        location_id = request.json["location"].lower()
-        request.json["location"] = location_id
+        location_id = data["location"].lower()
+        data["location"] = location_id
         location = mongoUtils.find("location", {"id": location_id})
         if not location:
             return f"Location {location_id} is not registered. Please add the location first", 400
@@ -116,35 +126,33 @@ class FunctionView(FlaskView):
         The request must provide the service details.
         used by: `katana function update -f [file]`
         """
-        data = request.json
+        data = request.get_json(silent=True) or {}
         data["_id"] = uuid
         old_data = mongoUtils.get("func", uuid)
 
         if old_data:
             data["created_at"] = old_data["created_at"]
             data["tenants"] = []
-            data["shared"]["sharing_list"] = {}
+            validation_error = self._validate_function_payload(data)
+            if validation_error:
+                return validation_error
             if len(old_data["tenants"]) > 0:
                 return f"Error: Func is used by slices {old_data['tenants']}"
             mongoUtils.update("func", uuid, data)
             return f"Modified {uuid}", 200
         else:
             new_uuid = uuid
-            data = request.json
+            data = request.get_json(silent=True) or {}
             data["_id"] = new_uuid
             data["created_at"] = time.time()  # unix epoch
             data["tenants"] = []
-            data["shared"]["sharing_list"] = {}
-
-            for field in self.req_fields:
-                try:
-                    _ = data[field]
-                except KeyError:
-                    return f"Error: Required fields: {self.req_fields}", 400
+            validation_error = self._validate_function_payload(data)
+            if validation_error:
+                return validation_error
 
             # Check that the VIM location is registered
-            location_id = request.json["location"].lower()
-            request.json["location"] = location_id
+            location_id = data["location"].lower()
+            data["location"] = location_id
             location = mongoUtils.find("location", {"id": location_id})
             if not location:
                 return (

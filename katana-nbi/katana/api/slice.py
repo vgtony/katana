@@ -33,6 +33,22 @@ class SliceView(FlaskView):
     urllib3.disable_warnings()
     route_prefix = "/api/"
 
+    def _validate_slice_payload(self, data):
+        if not isinstance(data, dict):
+            return "Error: Request body must be a JSON object", 400
+
+        base_slice_descriptor = data.get("base_slice_descriptor")
+        if base_slice_descriptor is None:
+            return "Error: Required field base_slice_descriptor is missing", 400
+        if not isinstance(base_slice_descriptor, dict):
+            return "Error: Field 'base_slice_descriptor' must be a JSON object", 400
+
+        for field in ("service_descriptor", "test_descriptor"):
+            if data.get(field) is not None and not isinstance(data[field], dict):
+                return f"Error: Field '{field}' must be a JSON object", 400
+
+        return None
+
     def index(self):
         """
         Returns a list of slices and their details,
@@ -87,9 +103,14 @@ class SliceView(FlaskView):
         used by: `katana slice add -f [file]`
         """
         new_uuid = str(uuid.uuid4())
-        request.json["_id"] = new_uuid
+        data = request.get_json(silent=True) or {}
+        data["_id"] = new_uuid
+        validation_error = self._validate_slice_payload(data)
+        if validation_error:
+            return validation_error
+
         # Get the NEST from the Slice Mapping process
-        nest, error_code = slice_mapping.nest_mapping(request.json)
+        nest, error_code = slice_mapping.nest_mapping(data)
 
         if error_code:
             return nest, error_code

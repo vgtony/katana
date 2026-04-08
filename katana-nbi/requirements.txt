@@ -30,3 +30,7 @@ werkzeug
 
 # SSH client (used by pao_alert and five_g_deployment)
 paramiko
+
+# Proxmox API client
+proxmoxer
+requests

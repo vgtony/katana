@@ -93,16 +93,16 @@ fi
 printf "********************************\n"
 printf "**** Building Katana images ****\n"
 printf "********************************\n"
-docker-compose -f ${DIR}/docker-compose.yaml build
+docker-compose -f "${DIR}/docker-compose.yaml" build
 if [[ "${PUSH_IMAGE}" == true ]]; then
     printf "*************************\n"
     printf "**** Pushing Images  ****\n"
     printf "*************************\n"
-    docker-compose -f ${DIR}/docker-compose.yaml push
+    docker-compose -f "${DIR}/docker-compose.yaml" push
 fi
 
 # Install the katana command
 printf "***********************************\n"
 printf "**** Installing Katana Command ****\n"
 printf "***********************************\n"
-command -v katana &> /dev/null || sudo cp ${DIR}/bin/katana /usr/local/bin/
+command -v katana &> /dev/null || sudo cp "${DIR}/bin/katana" /usr/local/bin/

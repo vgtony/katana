@@ -3,7 +3,7 @@
 function build_katana_images {
     if [[ "${NO_BUILD}" != true ]]
     then
-        docker-compose -f ${DIR}/docker-compose.yaml build
+        docker compose -f "${DIR}/docker-compose.yaml" build
     else
         printf "ERROR: Could not pull Docker images and the --no_build flag is set\n"
         exit 1
@@ -55,10 +55,10 @@ do
     -m | --monitoring)
         containers="${containers} katana-prometheus katana-grafana katana-nfv_mon katana-alertmanager"
         # Check if katana-grafana/.env file exists - If not create it
-        if [ ! -f ${DIR}/katana-grafana/.env ];
+        if [ ! -f "${DIR}/katana-grafana/.env" ];
         then
-        echo "GF_SECURITY_ADMIN_PASSWORD=admin" > ${DIR}/katana-grafana/.env
-        echo "GF_SECURITY_ADMIN_USER=admin" >> ${DIR}/katana-grafana/.env
+        echo "GF_SECURITY_ADMIN_PASSWORD=admin" > "${DIR}/katana-grafana/.env"
+        echo "GF_SECURITY_ADMIN_USER=admin" >> "${DIR}/katana-grafana/.env"
         fi
         export KATANA_MONITORING=True
         shift
@@ -116,23 +116,25 @@ do
 done
 
 # If Release Tag is set, try to download it. Otherwise set it to test and build the images
-if [[ -z ${DOCKER_TAG+x} ]];
+export DOCKER_TAG=${DOCKER_TAG:-test}
+export DOCKER_REG=${DOCKER_REG:-""}
+export DOCKER_REPO=${DOCKER_REPO:-""}
+if [[ -z ${DOCKER_TAG_OVERRIDE+x} ]];
 then
-    export DOCKER_TAG=test
     build_katana_images
 else
     # Check if the Docker user and passwd are set. If yes, login to docker registry
     if [[ ! -z ${DOCKER_REG_USER+x} && ! -z ${DOCKER_REG_PASSWD+x} ]]; then
         docker login -u ${DOCKER_REG_USER} -p ${DOCKER_REG_PASSWD} ${DOCKER_REG}
     fi
-    docker-compose -f ${DIR}/docker-compose.yaml pull || build_katana_images
+    docker compose -f "${DIR}/docker-compose.yaml" pull || build_katana_images
 fi
 
 # Install the command for the cli tool to /usr/local/bin/
-command -v katana &> /dev/null || sudo cp ${DIR}/bin/katana /usr/local/bin/
+command -v katana &> /dev/null || sudo cp "${DIR}/bin/katana" /usr/local/bin/
 
 # Start the docker containers on the background
-docker-compose up -d ${containers}
+docker compose up -d ${containers}
 
 # Fix the Release number and Katana IP on swagger
 docker exec katana-swagger sh /my_swagger/fixVersion.sh

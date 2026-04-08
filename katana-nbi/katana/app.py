@@ -22,6 +22,7 @@ from katana.api import (
     getTrustLevelView,
     PaoAlertView,
 )
+from katana.api.proxmox import ProxmoxView
 
 def create_app():
     """
@@ -56,6 +57,7 @@ def create_app():
     InitSGCView.register(app, trailing_slash=False)
     getTrustLevelView.register(app, trailing_slash=False)
     PaoAlertView.register(app, trailing_slash=False)
+    ProxmoxView.register(app, trailing_slash=False)
 
     # Setup logging
     logger = logging.getLogger("katana")

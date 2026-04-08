@@ -1,7 +1,22 @@
+import collections
 import functools
 import logging
 from logging import handlers
 from multiprocessing import Process
+
+from collections import abc
+
+for _alias in (
+    "Mapping",
+    "MutableMapping",
+    "Sequence",
+    "MutableSequence",
+    "Set",
+    "MutableSet",
+    "Iterable",
+):
+    if not hasattr(collections, _alias):
+        setattr(collections, _alias, getattr(abc, _alias))
 
 import openstack
 
@@ -311,4 +326,3 @@ class Openstack:
             print(f"Failed to retrieve Nova statistics: {e}")
 
         return report
-

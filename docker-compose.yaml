@@ -1,5 +1,3 @@
-version: "3.3"
-
 services:
   mongo:
     image: "mongo:4.4"  # Upgraded from 4.0.5 to satisfy PyMongo Wire Version 8 requirement
@@ -48,7 +46,7 @@ services:
       - zookeeper
 
   katana-nbi:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-nbi:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-nbi:${DOCKER_TAG:-test}"
     build:
       context: .
       dockerfile: katana-nbi/Dockerfile
@@ -60,15 +58,15 @@ services:
       - "8000:8000"
     environment:
       PYTHONWARNINGS: "ignore:Unverified HTTPS request"
-      KATANA_MONITORING: ${KATANA_MONITORING}
-      APEX: ${APEX}
+      KATANA_MONITORING: ${KATANA_MONITORING:-}
+      APEX: ${APEX:-}
     restart: always
     depends_on:
       - kafka
       - mongo
 
   katana-mngr:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-mngr:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-mngr:${DOCKER_TAG:-test}"
     container_name: katana-mngr
     build:
       context: .
@@ -77,8 +75,8 @@ services:
     volumes:
       - "katana-grafana-templates:/katana-grafana/templates"
     environment:
-      KATANA_MONITORING: ${KATANA_MONITORING}
-      APEX: ${APEX}
+      KATANA_MONITORING: ${KATANA_MONITORING:-}
+      APEX: ${APEX:-}
     env_file:
       - "katana-mngr/.env"
       - "katana-grafana/.env"
@@ -88,7 +86,7 @@ services:
       - mongo
 
   katana-cli:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-cli:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-cli:${DOCKER_TAG:-test}"
     container_name: katana-cli
     build:
       context: .
@@ -102,7 +100,7 @@ services:
       - katana-nbi
 
   katana-swagger:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-swagger:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-swagger:${DOCKER_TAG:-test}"
     container_name: katana-swagger
     build:
       context: .
@@ -110,15 +108,15 @@ services:
     restart: always
     environment:
       - SWAGGER_JSON=/my_swagger/swagger.json
-      - KATANA_HOST=${KATANA_HOST}
-      - KATANA_VERSION=${DOCKER_TAG}
+      - KATANA_HOST=${KATANA_HOST:-127.0.0.1}
+      - KATANA_VERSION=${DOCKER_TAG:-test}
     ports:
       - "8001:8080"
     depends_on:
       - katana-mngr
 
   katana-prometheus:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-prometheus:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-prometheus:${DOCKER_TAG:-test}"
     container_name: katana-prometheus
     build:
       context: .
@@ -136,7 +134,7 @@ services:
       - "9090:9090"
 
   katana-alertmanager:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-alertmanager:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-alertmanager:${DOCKER_TAG:-test}"
     container_name: katana-alertmanager
     build:
       context: .
@@ -150,7 +148,7 @@ services:
       - katana-alertmanager:/alertmanager
 
   katana-grafana:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-grafana:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-grafana:${DOCKER_TAG:-test}"
     container_name: katana-grafana
     build:
       context: .
@@ -163,7 +161,7 @@ services:
       - katana-prometheus
 
   katana-nfv_mon:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-nfv_mon:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-nfv_mon:${DOCKER_TAG:-test}"
     container_name: katana-nfv_mon
     build:
       context: .
@@ -180,7 +178,7 @@ services:
       - katana-grafana
 
   katana-apex:
-    image: "${DOCKER_REG}${DOCKER_REPO}katana-apex:${DOCKER_TAG}"
+    image: "${DOCKER_REG:-}${DOCKER_REPO:-}katana-apex:${DOCKER_TAG:-test}"
     container_name: katana-apex
     build:
       context: .

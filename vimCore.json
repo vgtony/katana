@@ -1,9 +1,9 @@
 {
   "id": "vim_core2",
   "name": "vim_Core2",
-  "auth_url": "http://10.160.101.246:5000/v3/",
+  "auth_url": "http://10.160.101.237:5000/v3/",
   "username": "admin",
-  "password": "XdTi5awxKgaNn4izxu3MNB9foKzOIxfXiHSgN3y4",
+  "password": "YuVVHGHPzxnKT5LbC65NgUSbxX9Fx9DlUvo1ANkI",
   "admin_project_name": "admin",
   "location": "core",
   "type": "openstack",
