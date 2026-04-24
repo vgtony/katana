@@ -1,0 +1,11 @@
+name: "main-proxmox-cluster"
+url: "https://10.0.0.10:8006"
+node: "pve-node-01"
+verify_ssl: false
+
+username: "root@pam"
+password: "change-me"
+
+# Optional token-based auth instead of password auth:
+# api_token_id: "root@pam!katana"
+# api_token_secret: "replace-with-secret"

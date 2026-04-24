@@ -1,0 +1,39 @@
+vms:
+  - name: "katana-vm-1"
+    template: 9000
+    cpu: 4
+    ram: 4096
+    storage_type: "local-lvm"
+    disk_size: 20
+    start: true
+    cloud_init:
+      ciuser: "ubuntu"
+      cipassword: "ubuntu"
+      nameserver: "8.8.8.8"
+      searchdomain: "local"
+    bridges:
+      - name: "vmbr0"
+        type: "management"
+      - name: "vmbr1.1601"
+        type: "custom"
+        ip: "192.168.50.10"
+        netmask: "255.255.255.0"
+        gateway: "192.168.50.1"
+        default_gateway: true
+
+  - name: "katana-vm-2"
+    template: 9000
+    cpu: 2
+    ram: 2048
+    storage_type: "local-lvm"
+    disk_size: 25
+    start: true
+    bridges:
+      - name: "vmbr0"
+        type: "management"
+      - name: "vmbr2"
+        type: "custom"
+        ip: "10.20.30.11"
+        netmask: "255.255.255.0"
+        gateway: "10.20.30.1"
+        default_gateway: true

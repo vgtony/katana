@@ -34,3 +34,6 @@ paramiko
 # Proxmox API client
 proxmoxer
 requests
+
+# Kubernetes Python client (used by kubernetesUtils)
+kubernetes

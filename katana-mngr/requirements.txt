@@ -11,3 +11,9 @@ openstacksdk==0.23.0
 
 #PyONE - OpenNebula
 pyone==5.8.2
+
+# Kubernetes Python client (used by kubernetesUtils)
+kubernetes
+
+# OpenStack SDK (used by openstackUtils)
+openstacksdk
