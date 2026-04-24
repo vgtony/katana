@@ -45,6 +45,23 @@ def _cpu_block(cpu_fraction: float, total_cores: float) -> Dict[str, Any]:
     }
 
 
+def _cpu_usage_summary(used_cores: float, total_cores: float) -> Dict[str, Any]:
+    return {
+        "used_cores_estimate": round(used_cores, 2),
+        "total_cores": total_cores,
+        "used_percent": round((used_cores / total_cores * 100.0), 2) if total_cores else 0.0,
+    }
+
+
+def _cpu_remaining_summary(used_cores: float, total_cores: float) -> Dict[str, Any]:
+    free_cores = max(total_cores - used_cores, 0)
+    return {
+        "free_cores_estimate": round(free_cores, 2),
+        "total_cores": total_cores,
+        "free_percent": round((free_cores / total_cores * 100.0), 2) if total_cores else 0.0,
+    }
+
+
 def build_cluster_overview(
     client: ProxmoxVEClient,
     cluster_name: str = "",
@@ -78,24 +95,76 @@ def build_cluster_overview(
     )
 
     nodes: List[Dict[str, Any]] = []
+    server_remaining_resources: List[Dict[str, Any]] = []
     for item in sorted(node_entries, key=lambda entry: entry.get("node", "")):
         total_cores = float(item.get("maxcpu", 0))
         cpu_fraction = float(item.get("cpu", 0))
+        used_cores = cpu_fraction * total_cores
         used_mem = float(item.get("mem", 0))
         total_mem = float(item.get("maxmem", 0))
         used_disk = float(item.get("disk", 0))
         total_disk = float(item.get("maxdisk", 0))
+        cpu_block = _cpu_block(cpu_fraction, total_cores)
+        memory_block = _resource_block(used_mem, total_mem)
+        disk_block = _resource_block(used_disk, total_disk)
 
         nodes.append(
             {
-                "node": item.get("node"),
+                "name": item.get("node"),
                 "status": item.get("status"),
                 "uptime_seconds": item.get("uptime"),
-                "cpu": _cpu_block(cpu_fraction, total_cores),
-                "memory": _resource_block(used_mem, total_mem),
-                "disk": _resource_block(used_disk, total_disk),
+                "usage": {
+                    "cpu": _cpu_usage_summary(used_cores, total_cores),
+                    "memory": {
+                        "used": memory_block["used"],
+                        "total": memory_block["total"],
+                        "used_percent": memory_block["used_percent"],
+                        "used_human": memory_block["used_human"],
+                        "total_human": memory_block["total_human"],
+                    },
+                    "disk": {
+                        "used": disk_block["used"],
+                        "total": disk_block["total"],
+                        "used_percent": disk_block["used_percent"],
+                        "used_human": disk_block["used_human"],
+                        "total_human": disk_block["total_human"],
+                    },
+                },
+                "remaining_resources": {
+                    "cpu": _cpu_remaining_summary(used_cores, total_cores),
+                    "memory": {
+                        "free": memory_block["free"],
+                        "total": memory_block["total"],
+                        "free_human": memory_block["free_human"],
+                        "total_human": memory_block["total_human"],
+                    },
+                    "disk": {
+                        "free": disk_block["free"],
+                        "total": disk_block["total"],
+                        "free_human": disk_block["free_human"],
+                        "total_human": disk_block["total_human"],
+                    },
+                },
                 "ssl_fingerprint": item.get("ssl_fingerprint"),
                 "level": item.get("level"),
+            }
+        )
+        server_remaining_resources.append(
+            {
+                "name": item.get("node"),
+                "cpu": _cpu_remaining_summary(used_cores, total_cores),
+                "memory": {
+                    "free": memory_block["free"],
+                    "total": memory_block["total"],
+                    "free_human": memory_block["free_human"],
+                    "total_human": memory_block["total_human"],
+                },
+                "disk": {
+                    "free": disk_block["free"],
+                    "total": disk_block["total"],
+                    "free_human": disk_block["free_human"],
+                    "total_human": disk_block["total_human"],
+                },
             }
         )
 
@@ -103,10 +172,13 @@ def build_cluster_overview(
     for item in sorted(vm_entries, key=lambda entry: (entry.get("node", ""), entry.get("vmid", 0))):
         total_cores = float(item.get("maxcpu", 0))
         cpu_fraction = float(item.get("cpu", 0))
+        used_cores = cpu_fraction * total_cores
         used_mem = float(item.get("mem", 0))
         total_mem = float(item.get("maxmem", 0))
         used_disk = float(item.get("disk", 0))
         total_disk = float(item.get("maxdisk", 0))
+        memory_block = _resource_block(used_mem, total_mem)
+        disk_block = _resource_block(used_disk, total_disk)
 
         vms.append(
             {
@@ -116,44 +188,64 @@ def build_cluster_overview(
                 "status": item.get("status"),
                 "template": item.get("template", 0) == 1,
                 "tags": item.get("tags"),
-                "cpu": _cpu_block(cpu_fraction, total_cores),
-                "memory": _resource_block(used_mem, total_mem),
-                "disk": _resource_block(used_disk, total_disk),
                 "uptime_seconds": item.get("uptime"),
+                "usage": {
+                    "cpu": _cpu_usage_summary(used_cores, total_cores),
+                    "memory": {
+                        "used": memory_block["used"],
+                        "total": memory_block["total"],
+                        "used_percent": memory_block["used_percent"],
+                        "used_human": memory_block["used_human"],
+                        "total_human": memory_block["total_human"],
+                    },
+                    "disk": {
+                        "used": disk_block["used"],
+                        "total": disk_block["total"],
+                        "used_percent": disk_block["used_percent"],
+                        "used_human": disk_block["used_human"],
+                        "total_human": disk_block["total_human"],
+                    },
+                },
+                "allocated_resources": {
+                    "cpu": {"total_cores": total_cores},
+                    "memory": {
+                        "total": memory_block["total"],
+                        "total_human": memory_block["total_human"],
+                    },
+                    "disk": {
+                        "total": disk_block["total"],
+                        "total_human": disk_block["total_human"],
+                    },
+                },
             }
         )
 
     return {
-        "cluster": {
-            "name": cluster_name or None,
-            "version": version,
-            "status": cluster_status,
-            "summary": {
-                "node_count": len(node_entries),
-                "online_node_count": len(online_nodes),
-                "vm_count": len(vm_entries),
-                "running_vm_count": len(running_vms),
-            },
-            "physical_resources": {
-                "cpu": {
-                    "used_cores_estimate": round(used_node_cpu_cores, 2),
-                    "total_cores": total_node_cpu,
-                    "free_cores_estimate": round(max(total_node_cpu - used_node_cpu_cores, 0), 2),
-                    "used_percent": round((used_node_cpu_cores / total_node_cpu * 100.0), 2)
-                    if total_node_cpu
-                    else 0.0,
+        "clusters": [
+            {
+                "name": cluster_name or None,
+                "version": version,
+                "status": cluster_status,
+                "summary": {
+                    "node_count": len(node_entries),
+                    "online_node_count": len(online_nodes),
+                    "vm_count": len(vm_entries),
+                    "running_vm_count": len(running_vms),
                 },
+            }
+        ],
+        "servers": nodes,
+        "vms": vms,
+        "usage": {
+            "physical_resources": {
+                "cpu": _cpu_usage_summary(used_node_cpu_cores, total_node_cpu),
                 "memory": _resource_block(used_node_mem, total_node_mem),
                 "disk": _resource_block(used_node_disk, total_node_disk),
             },
             "vm_resources": {
                 "cpu": {
-                    "used_cores_estimate": round(used_vm_cpu_cores, 2),
+                    **_cpu_usage_summary(used_vm_cpu_cores, total_vm_cpu),
                     "allocated_cores": total_vm_cpu,
-                    "free_vs_allocated_cores_estimate": round(max(total_vm_cpu - used_vm_cpu_cores, 0), 2),
-                    "used_percent_of_allocated": round((used_vm_cpu_cores / total_vm_cpu * 100.0), 2)
-                    if total_vm_cpu
-                    else 0.0,
                 },
                 "memory": {
                     **_resource_block(used_vm_mem, total_vm_mem),
@@ -165,6 +257,22 @@ def build_cluster_overview(
                 },
             },
         },
-        "servers": nodes,
-        "vms": vms,
+        "remaining_resources": {
+            "cluster": {
+                "cpu": _cpu_remaining_summary(used_node_cpu_cores, total_node_cpu),
+                "memory": {
+                    "free": max(total_node_mem - used_node_mem, 0),
+                    "total": total_node_mem,
+                    "free_human": _format_bytes(max(total_node_mem - used_node_mem, 0)),
+                    "total_human": _format_bytes(total_node_mem),
+                },
+                "disk": {
+                    "free": max(total_node_disk - used_node_disk, 0),
+                    "total": total_node_disk,
+                    "free_human": _format_bytes(max(total_node_disk - used_node_disk, 0)),
+                    "total_human": _format_bytes(total_node_disk),
+                },
+            },
+            "servers": server_remaining_resources,
+        },
     }

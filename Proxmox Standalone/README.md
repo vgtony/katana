@@ -123,6 +123,12 @@ Health check:
 curl http://127.0.0.1:8099/health
 ```
 
+List available endpoints:
+
+```bash
+curl http://127.0.0.1:8099/api
+```
+
 Test Proxmox authentication:
 
 ```bash
@@ -138,10 +144,112 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/test \
   }'
 ```
 
+UI-friendly connect endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:8099/api/proxmox/connect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "main-proxmox-cluster",
+    "url": "https://10.0.0.10:8006",
+    "node": "pve-node-01",
+    "verify_ssl": false,
+    "username": "root@pam",
+    "password": "change-me"
+  }'
+```
+
+The `overview` response now has a cleaner app-friendly shape:
+
+```json
+{
+  "clusters": [],
+  "servers": [],
+  "vms": [],
+  "usage": {},
+  "remaining_resources": {}
+}
+```
+
 Get cluster, servers, VMs, usage, and remaining resources:
 
 ```bash
 curl -X POST http://127.0.0.1:8099/api/proxmox/overview \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "main-proxmox-cluster",
+    "url": "https://10.0.0.10:8006",
+    "node": "pve-node-01",
+    "verify_ssl": false,
+    "username": "root@pam",
+    "password": "change-me"
+  }'
+```
+
+Get only cluster metadata:
+
+```bash
+curl -X POST http://127.0.0.1:8099/api/proxmox/clusters \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "main-proxmox-cluster",
+    "url": "https://10.0.0.10:8006",
+    "node": "pve-node-01",
+    "verify_ssl": false,
+    "username": "root@pam",
+    "password": "change-me"
+  }'
+```
+
+Get only servers/nodes:
+
+```bash
+curl -X POST http://127.0.0.1:8099/api/proxmox/servers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "main-proxmox-cluster",
+    "url": "https://10.0.0.10:8006",
+    "node": "pve-node-01",
+    "verify_ssl": false,
+    "username": "root@pam",
+    "password": "change-me"
+  }'
+```
+
+Get only VMs:
+
+```bash
+curl -X POST http://127.0.0.1:8099/api/proxmox/vms \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "main-proxmox-cluster",
+    "url": "https://10.0.0.10:8006",
+    "node": "pve-node-01",
+    "verify_ssl": false,
+    "username": "root@pam",
+    "password": "change-me"
+  }'
+```
+
+Get only usage:
+
+```bash
+curl -X POST http://127.0.0.1:8099/api/proxmox/usage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "main-proxmox-cluster",
+    "url": "https://10.0.0.10:8006",
+    "node": "pve-node-01",
+    "verify_ssl": false,
+    "username": "root@pam",
+    "password": "change-me"
+  }'
+```
+
+Get only remaining resources:
+
+```bash
+curl -X POST http://127.0.0.1:8099/api/proxmox/remaining-resources \
   -H "Content-Type: application/json" \
   -d '{
     "name": "main-proxmox-cluster",
@@ -181,11 +289,12 @@ curl -X POST "http://127.0.0.1:8099/api/proxmox/list-vms?node=pve-node-01" \
 ## Notes
 
 - The `overview` command uses Proxmox cluster and resource endpoints to summarize:
-  - cluster information
-  - servers/nodes
-  - VMs
-  - physical CPU, RAM, and disk usage
-  - remaining physical capacity per node and across the cluster
+  - `clusters`: cluster metadata and summary
+  - `servers`: Proxmox nodes with per-node usage and remaining resources
+  - `vms`: VM inventory with per-VM usage and allocated resources
+  - `usage`: cluster-wide physical and VM-estate usage
+  - `remaining_resources`: cluster-wide and per-server remaining capacity
+- The standalone HTTP server sends permissive CORS headers so a browser-based UI can call it directly during testing.
 - This integration focuses on the Proxmox VE side of provisioning.
 - For multi-homed guests, cloud-init can set multiple IPs, but only one interface should own the default gateway. Use `default_gateway: true` on the interface that should carry it.
 - If your template does not support cloud-init, VM creation still works, but guest-side IP setup will need to happen inside the VM.
