@@ -39,7 +39,6 @@ Use either `username` + `password` or `api_token_id` + `api_token_secret`.
 ```yaml
 name: "main-proxmox-cluster"
 url: "https://10.0.0.10:8006"
-node: "pve-node-01"
 verify_ssl: false
 
 username: "root@pam"
@@ -48,6 +47,9 @@ password: "change-me"
 # Optional token-based auth instead of password auth
 # api_token_id: "root@pam!katana"
 # api_token_secret: "replace-with-secret"
+
+# Optional for node-specific calls like list-vms or provisioning
+# node: "pve-node-01"
 ```
 
 ## VM config
@@ -137,7 +139,6 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/test \
   -d '{
     "name": "main-proxmox-cluster",
     "url": "https://10.0.0.10:8006",
-    "node": "pve-node-01",
     "verify_ssl": false,
     "username": "root@pam",
     "password": "change-me"
@@ -152,7 +153,20 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/connect \
   -d '{
     "name": "main-proxmox-cluster",
     "url": "https://10.0.0.10:8006",
-    "node": "pve-node-01",
+    "verify_ssl": false,
+    "username": "root@pam",
+    "password": "change-me"
+  }'
+```
+
+Get nodes after connecting:
+
+```bash
+curl -X POST http://127.0.0.1:8099/api/proxmox/nodes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "main-proxmox-cluster",
+    "url": "https://10.0.0.10:8006",
     "verify_ssl": false,
     "username": "root@pam",
     "password": "change-me"
@@ -179,7 +193,6 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/overview \
   -d '{
     "name": "main-proxmox-cluster",
     "url": "https://10.0.0.10:8006",
-    "node": "pve-node-01",
     "verify_ssl": false,
     "username": "root@pam",
     "password": "change-me"
@@ -194,7 +207,6 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/clusters \
   -d '{
     "name": "main-proxmox-cluster",
     "url": "https://10.0.0.10:8006",
-    "node": "pve-node-01",
     "verify_ssl": false,
     "username": "root@pam",
     "password": "change-me"
@@ -209,7 +221,6 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/servers \
   -d '{
     "name": "main-proxmox-cluster",
     "url": "https://10.0.0.10:8006",
-    "node": "pve-node-01",
     "verify_ssl": false,
     "username": "root@pam",
     "password": "change-me"
@@ -224,7 +235,6 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/vms \
   -d '{
     "name": "main-proxmox-cluster",
     "url": "https://10.0.0.10:8006",
-    "node": "pve-node-01",
     "verify_ssl": false,
     "username": "root@pam",
     "password": "change-me"
@@ -239,7 +249,6 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/usage \
   -d '{
     "name": "main-proxmox-cluster",
     "url": "https://10.0.0.10:8006",
-    "node": "pve-node-01",
     "verify_ssl": false,
     "username": "root@pam",
     "password": "change-me"
@@ -262,6 +271,7 @@ curl -X POST http://127.0.0.1:8099/api/proxmox/remaining-resources \
 ```
 
 List VMs for a specific node:
+This is one of the few calls where `node` is required.
 
 ```bash
 curl -X POST "http://127.0.0.1:8099/api/proxmox/list-vms?node=pve-node-01" \
@@ -269,7 +279,6 @@ curl -X POST "http://127.0.0.1:8099/api/proxmox/list-vms?node=pve-node-01" \
   -d '{
     "name": "main-proxmox-cluster",
     "url": "https://10.0.0.10:8006",
-    "node": "pve-node-01",
     "verify_ssl": false,
     "username": "root@pam",
     "password": "change-me"
@@ -295,6 +304,11 @@ curl -X POST "http://127.0.0.1:8099/api/proxmox/list-vms?node=pve-node-01" \
   - `usage`: cluster-wide physical and VM-estate usage
   - `remaining_resources`: cluster-wide and per-server remaining capacity
 - The standalone HTTP server sends permissive CORS headers so a browser-based UI can call it directly during testing.
+- `node` is optional for login and discovery calls. The intended UI flow is:
+  1. call `/api/proxmox/connect` with URL and credentials
+  2. read the returned `nodes`
+  3. let the user choose a node
+  4. call node-specific endpoints such as `/api/proxmox/list-vms?node=...`
 - This integration focuses on the Proxmox VE side of provisioning.
 - For multi-homed guests, cloud-init can set multiple IPs, but only one interface should own the default gateway. Use `default_gateway: true` on the interface that should carry it.
 - If your template does not support cloud-init, VM creation still works, but guest-side IP setup will need to happen inside the VM.

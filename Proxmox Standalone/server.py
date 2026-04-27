@@ -70,7 +70,12 @@ class ProxmoxHTTPRequestHandler(BaseHTTPRequestHandler):
                     {
                         "method": "POST",
                         "path": "/api/proxmox/connect",
-                        "description": "Alias for auth test, useful for UI login flow",
+                        "description": "Connect using only URL and credentials, then return available nodes",
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/api/proxmox/nodes",
+                        "description": "Return available Proxmox nodes for the authenticated user",
                     },
                     {
                         "method": "POST",
@@ -157,13 +162,27 @@ class ProxmoxHTTPRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if method == "POST" and path == "/api/proxmox/nodes":
+            body = self._read_json_body()
+            client = self._load_client(body)
+            self._send_json(
+                200,
+                {
+                    "cluster": body.get("name"),
+                    "nodes": client.list_nodes(),
+                },
+            )
+            return
+
         if method == "POST" and path == "/api/proxmox/list-vms":
             body = self._read_json_body()
             query_params = parse_qs(parsed.query)
             client = self._load_client(body)
             node = query_params.get("node", [body.get("node")])[0]
             if not node:
-                raise ValueError("Missing 'node' in request body or query string")
+                raise ValueError(
+                    "Missing 'node'. First call /api/proxmox/connect or /api/proxmox/nodes to fetch available nodes, then pass the selected node here."
+                )
 
             self._send_json(
                 200,
