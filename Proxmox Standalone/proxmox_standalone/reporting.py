@@ -62,6 +62,29 @@ def _cpu_remaining_summary(used_cores: float, total_cores: float) -> Dict[str, A
     }
 
 
+def _storage_option_block(item: Dict[str, Any]) -> Dict[str, Any]:
+    used_disk = float(item.get("disk", 0))
+    total_disk = float(item.get("maxdisk", 0))
+    disk_block = _resource_block(used_disk, total_disk)
+    return {
+        "storage": item.get("storage"),
+        "node": item.get("node"),
+        "type": item.get("plugintype"),
+        "shared": bool(item.get("shared", 0)),
+        "status": item.get("status"),
+        "content": item.get("content"),
+        "enabled": item.get("enabled"),
+        "maximum_load": disk_block["total"],
+        "maximum_load_human": disk_block["total_human"],
+        "used": disk_block["used"],
+        "used_human": disk_block["used_human"],
+        "used_percent": disk_block["used_percent"],
+        "remaining": disk_block["free"],
+        "remaining_human": disk_block["free_human"],
+        "remaining_percent": round((disk_block["free"] / total_disk * 100.0), 2) if total_disk else 0.0,
+    }
+
+
 def build_cluster_overview(
     client: ProxmoxVEClient,
     cluster_name: str = "",
@@ -72,6 +95,10 @@ def build_cluster_overview(
 
     node_entries = [item for item in cluster_resources if item.get("type") == "node"]
     vm_entries = [item for item in cluster_resources if item.get("type") == "qemu"]
+    storage_entries = [
+        item for item in cluster_resources
+        if item.get("type") == "storage" and item.get("storage")
+    ]
 
     online_nodes = [item for item in node_entries if item.get("status") == "online"]
     running_vms = [item for item in vm_entries if item.get("status") == "running"]
@@ -93,10 +120,21 @@ def build_cluster_overview(
     used_vm_cpu_cores = sum(
         float(item.get("cpu", 0)) * float(item.get("maxcpu", 0)) for item in vm_entries
     )
+    cluster_storage_options = [
+        _storage_option_block(item)
+        for item in sorted(
+            storage_entries,
+            key=lambda entry: (
+                entry.get("storage", ""),
+                entry.get("node", ""),
+            ),
+        )
+    ]
 
     nodes: List[Dict[str, Any]] = []
     server_remaining_resources: List[Dict[str, Any]] = []
     for item in sorted(node_entries, key=lambda entry: entry.get("node", "")):
+        node_name = item.get("node")
         total_cores = float(item.get("maxcpu", 0))
         cpu_fraction = float(item.get("cpu", 0))
         used_cores = cpu_fraction * total_cores
@@ -107,12 +145,18 @@ def build_cluster_overview(
         cpu_block = _cpu_block(cpu_fraction, total_cores)
         memory_block = _resource_block(used_mem, total_mem)
         disk_block = _resource_block(used_disk, total_disk)
+        node_storage_options = [
+            _storage_option_block(storage_item)
+            for storage_item in storage_entries
+            if storage_item.get("node") == node_name
+        ]
 
         nodes.append(
             {
-                "name": item.get("node"),
+                "name": node_name,
                 "status": item.get("status"),
                 "uptime_seconds": item.get("uptime"),
+                "storage_options": node_storage_options,
                 "usage": {
                     "cpu": _cpu_usage_summary(used_cores, total_cores),
                     "memory": {
@@ -151,7 +195,7 @@ def build_cluster_overview(
         )
         server_remaining_resources.append(
             {
-                "name": item.get("node"),
+                "name": node_name,
                 "cpu": _cpu_remaining_summary(used_cores, total_cores),
                 "memory": {
                     "free": memory_block["free"],
@@ -165,6 +209,7 @@ def build_cluster_overview(
                     "free_human": disk_block["free_human"],
                     "total_human": disk_block["total_human"],
                 },
+                "storage_options": node_storage_options,
             }
         )
 
@@ -272,6 +317,7 @@ def build_cluster_overview(
                     "free_human": _format_bytes(max(total_node_disk - used_node_disk, 0)),
                     "total_human": _format_bytes(total_node_disk),
                 },
+                "storage_options": cluster_storage_options,
             },
             "servers": server_remaining_resources,
         },
