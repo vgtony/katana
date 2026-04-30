@@ -189,6 +189,26 @@ class ProxmoxVEClient:
             payload["target"] = target
         return self.post(f"nodes/{node}/qemu/{int(template_vmid)}/clone", data=payload)
 
+    def create_vm(
+        self,
+        node: str,
+        vmid: int,
+        name: str,
+        memory: int,
+        cores: int,
+        scsihw: str = "virtio-scsi-pci",
+        ostype: str = "l26",
+    ) -> Any:
+        payload: Dict[str, Any] = {
+            "vmid": int(vmid),
+            "name": name,
+            "memory": int(memory),
+            "cores": int(cores),
+            "scsihw": scsihw,
+            "ostype": ostype,
+        }
+        return self.post(f"nodes/{node}/qemu", data=payload)
+
     def update_vm_config(self, node: str, vmid: int, **kwargs: Any) -> Any:
         payload = {key: value for key, value in kwargs.items() if value is not None}
         return self.put(f"nodes/{node}/qemu/{int(vmid)}/config", data=payload)

@@ -80,6 +80,10 @@ vms:
         default_gateway: true
 ```
 
+`template` is optional:
+- if `template` is present, the VM is cloned from that template
+- if `template` is omitted, a fresh VM is created on the selected storage
+
 ## Commands
 
 Test the connection:

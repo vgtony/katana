@@ -56,7 +56,7 @@ class BridgeSpec:
 @dataclass
 class VmSpec:
     name: str
-    template: int
+    template: Optional[int]
     cpu: int
     ram: int
     storage_type: str
@@ -68,10 +68,12 @@ class VmSpec:
     full_clone: bool = True
     disk_name: str = "scsi0"
     cloud_init: Dict[str, Any] = field(default_factory=dict)
+    ostype: str = "l26"
+    scsihw: str = "virtio-scsi-pci"
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "VmSpec":
-        required = ["name", "template", "cpu", "ram", "storage_type", "disk_size", "bridges"]
+        required = ["name", "cpu", "ram", "storage_type", "disk_size", "bridges"]
         missing = [field for field in required if field not in data]
         if missing:
             raise ValueError(f"VM '{data.get('name', 'unknown')}' is missing: {', '.join(missing)}")
@@ -82,7 +84,7 @@ class VmSpec:
 
         return cls(
             name=data["name"],
-            template=int(data["template"]),
+            template=int(data["template"]) if data.get("template") is not None else None,
             cpu=int(data["cpu"]),
             ram=int(data["ram"]),
             storage_type=data["storage_type"],
@@ -94,6 +96,8 @@ class VmSpec:
             full_clone=data.get("full_clone", True),
             disk_name=data.get("disk_name", "scsi0"),
             cloud_init=data.get("cloud_init", {}),
+            ostype=data.get("ostype", "l26"),
+            scsihw=data.get("scsihw", "virtio-scsi-pci"),
         )
 
 
@@ -122,23 +126,47 @@ class ProxmoxProvisioner:
 
     def provision_vm(self, vm: VmSpec) -> Dict[str, Any]:
         vmid = self.client.next_vmid()
-        clone_task = self.client.clone_vm(
-            node=self.node,
-            template_vmid=vm.template,
-            new_vmid=vmid,
-            name=vm.name,
-            storage=vm.storage_type,
-            pool=vm.pool,
-            target=vm.target,
-            full=vm.full_clone,
-        )
-        self.client.wait_for_task(self.node, clone_task)
+        clone_task = None
+        create_task = None
+        source = "template-clone" if vm.template is not None else "fresh-create"
+
+        if vm.template is not None:
+            clone_task = self.client.clone_vm(
+                node=self.node,
+                template_vmid=vm.template,
+                new_vmid=vmid,
+                name=vm.name,
+                storage=vm.storage_type,
+                pool=vm.pool,
+                target=vm.target,
+                full=vm.full_clone,
+            )
+            self.client.wait_for_task(self.node, clone_task)
+        else:
+            create_task = self.client.create_vm(
+                node=self.node,
+                vmid=vmid,
+                name=vm.name,
+                memory=vm.ram,
+                cores=vm.cpu,
+                scsihw=vm.scsihw,
+                ostype=vm.ostype,
+            )
+            self.client.wait_for_task(self.node, create_task)
 
         self.client.update_vm_config(self.node, vmid, cores=vm.cpu, memory=vm.ram)
 
+        if vm.template is None:
+            self.client.update_vm_config(
+                self.node,
+                vmid,
+                scsi0=f"{vm.storage_type}:{vm.disk_size}",
+            )
+
         if vm.disk_size > 0:
             try:
-                self.client.resize_disk(self.node, vmid, vm.disk_name, f"{vm.disk_size}G")
+                if vm.template is not None:
+                    self.client.resize_disk(self.node, vmid, vm.disk_name, f"{vm.disk_size}G")
             except Exception as exc:
                 logger.warning("Disk resize for VM %s failed: %s", vm.name, exc)
 
@@ -159,10 +187,12 @@ class ProxmoxProvisioner:
             "name": vm.name,
             "vmid": vmid,
             "template": vm.template,
+            "source": source,
             "node": self.node,
             "status": "created",
             "started": vm.start,
             "clone_task": clone_task,
+            "create_task": create_task,
             "start_task": start_task,
             "warnings": warnings,
             "bridges": [bridge.__dict__ for bridge in vm.bridges],
