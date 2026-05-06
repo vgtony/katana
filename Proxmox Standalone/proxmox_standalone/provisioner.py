@@ -1,12 +1,16 @@
 import ipaddress
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from .client import ProxmoxVEClient
+from .client import ProxmoxAPIError, ProxmoxVEClient
 
 
 logger = logging.getLogger(__name__)
+
+BRIDGE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[0-9]+)?$")
 
 
 @dataclass
@@ -38,6 +42,8 @@ class BridgeSpec:
         return bridge
 
     def validate(self) -> None:
+        self._validate_name()
+
         if self.type not in {"management", "custom"}:
             raise ValueError(f"Unsupported bridge type '{self.type}' for bridge '{self.name}'")
 
@@ -51,6 +57,25 @@ class BridgeSpec:
             ipaddress.IPv4Network(f"0.0.0.0/{self.netmask}", strict=False)
             if self.gateway:
                 ipaddress.ip_address(self.gateway)
+
+    def _validate_name(self) -> None:
+        if not self.name:
+            raise ValueError("Bridge name is required")
+        if ":" in self.name:
+            raise ValueError(
+                f"Bridge '{self.name}' is invalid. Use 'vmbr1' or 'vmbr1.<vlan_id>', not ':'."
+            )
+        if not BRIDGE_NAME_RE.match(self.name):
+            raise ValueError(
+                f"Bridge '{self.name}' is invalid. Allowed format is bridge or bridge.<vlan_id>."
+            )
+        if "." in self.name:
+            _, vlan = self.name.split(".", 1)
+            vlan_id = int(vlan)
+            if vlan_id < 1 or vlan_id > 4094:
+                raise ValueError(
+                    f"Bridge '{self.name}' has invalid VLAN '{vlan}'. VLAN must be 1-4094."
+                )
 
 
 @dataclass
@@ -70,13 +95,43 @@ class VmSpec:
     cloud_init: Dict[str, Any] = field(default_factory=dict)
     ostype: str = "l26"
     scsihw: str = "virtio-scsi-pci"
+    boot: Optional[str] = None
+    bootdisk: str = "scsi0"
+    agent: Optional[int] = None
+    onboot: Optional[int] = None
+    tags: Optional[str] = None
+    description: Optional[str] = None
+    wait_for_ip: bool = False
+    ip_wait_timeout: int = 120
+    ip_poll_interval: int = 5
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "VmSpec":
+        if not isinstance(data, dict):
+            raise ValueError("Each VM definition must be an object")
+
         required = ["name", "cpu", "ram", "storage_type", "disk_size", "bridges"]
         missing = [field for field in required if field not in data]
         if missing:
             raise ValueError(f"VM '{data.get('name', 'unknown')}' is missing: {', '.join(missing)}")
+
+        template = data.get("template")
+        if template == "":
+            template = None
+        if template is not None:
+            template = int(template)
+            if template <= 0:
+                raise ValueError(f"VM '{data['name']}' template must be a positive VMID")
+
+        cpu = int(data["cpu"])
+        ram = int(data["ram"])
+        disk_size = int(data["disk_size"])
+        if cpu <= 0:
+            raise ValueError(f"VM '{data['name']}' cpu must be greater than 0")
+        if ram <= 0:
+            raise ValueError(f"VM '{data['name']}' ram must be greater than 0")
+        if disk_size <= 0:
+            raise ValueError(f"VM '{data['name']}' disk_size must be greater than 0")
 
         bridges = [BridgeSpec.from_dict(item) for item in data["bridges"]]
         if not bridges:
@@ -84,11 +139,11 @@ class VmSpec:
 
         return cls(
             name=data["name"],
-            template=int(data["template"]) if data.get("template") is not None else None,
-            cpu=int(data["cpu"]),
-            ram=int(data["ram"]),
+            template=template,
+            cpu=cpu,
+            ram=ram,
             storage_type=data["storage_type"],
-            disk_size=int(data["disk_size"]),
+            disk_size=disk_size,
             bridges=bridges,
             pool=data.get("pool"),
             target=data.get("target"),
@@ -98,6 +153,15 @@ class VmSpec:
             cloud_init=data.get("cloud_init", {}),
             ostype=data.get("ostype", "l26"),
             scsihw=data.get("scsihw", "virtio-scsi-pci"),
+            boot=data.get("boot"),
+            bootdisk=data.get("bootdisk", "scsi0"),
+            agent=data.get("agent"),
+            onboot=data.get("onboot"),
+            tags=data.get("tags"),
+            description=data.get("description"),
+            wait_for_ip=data.get("wait_for_ip", False),
+            ip_wait_timeout=int(data.get("ip_wait_timeout", 120)),
+            ip_poll_interval=int(data.get("ip_poll_interval", 5)),
         )
 
 
@@ -129,73 +193,214 @@ class ProxmoxProvisioner:
         clone_task = None
         create_task = None
         source = "template-clone" if vm.template is not None else "fresh-create"
+        warnings: List[str] = []
+        storage_id = self._storage_id(vm.storage_type)
+        source_node = self.node
+        deployment_node = vm.target or self.node
 
         if vm.template is not None:
+            self._validate_template(source_node, vm.template)
             clone_task = self.client.clone_vm(
-                node=self.node,
+                node=source_node,
                 template_vmid=vm.template,
                 new_vmid=vmid,
                 name=vm.name,
-                storage=vm.storage_type,
+                storage=storage_id,
                 pool=vm.pool,
                 target=vm.target,
                 full=vm.full_clone,
             )
-            self.client.wait_for_task(self.node, clone_task)
+            self.client.wait_for_task(source_node, clone_task)
         else:
             create_task = self.client.create_vm(
-                node=self.node,
+                node=deployment_node,
                 vmid=vmid,
                 name=vm.name,
                 memory=vm.ram,
                 cores=vm.cpu,
                 scsihw=vm.scsihw,
                 ostype=vm.ostype,
+                disk=f"{storage_id}:{vm.disk_size}",
+                boot=vm.boot or f"order={vm.bootdisk}",
+                bootdisk=vm.bootdisk,
+                extra_config=self._optional_vm_config(vm),
             )
-            self.client.wait_for_task(self.node, create_task)
-
-        self.client.update_vm_config(self.node, vmid, cores=vm.cpu, memory=vm.ram)
-
-        if vm.template is None:
-            self.client.update_vm_config(
-                self.node,
-                vmid,
-                scsi0=f"{vm.storage_type}:{vm.disk_size}",
+            self.client.wait_for_task(deployment_node, create_task)
+            warnings.append(
+                "Fresh VM was created with an empty disk. Attach/install an OS or provide boot media if it should boot immediately."
             )
 
-        if vm.disk_size > 0:
+        self.client.update_vm_config(
+            deployment_node,
+            vmid,
+            cores=vm.cpu,
+            memory=vm.ram,
+            **self._optional_vm_config(vm),
+        )
+
+        if vm.template is not None and vm.disk_size > 0:
             try:
-                if vm.template is not None:
-                    self.client.resize_disk(self.node, vmid, vm.disk_name, f"{vm.disk_size}G")
+                self.client.resize_disk(deployment_node, vmid, vm.disk_name, f"{vm.disk_size}G")
             except Exception as exc:
+                warnings.append(f"Disk resize failed for {vm.disk_name}: {exc}")
                 logger.warning("Disk resize for VM %s failed: %s", vm.name, exc)
 
         nic_config = self._build_nic_config(vm.bridges)
         if nic_config:
-            self.client.update_vm_config(self.node, vmid, **nic_config)
+            self.client.update_vm_config(deployment_node, vmid, **nic_config)
 
-        cloud_init_config, warnings = self._build_cloud_init_config(vm.bridges, vm.cloud_init)
+        cloud_init_config, cloud_init_warnings = self._build_cloud_init_config(
+            vm.bridges,
+            vm.cloud_init,
+        )
+        warnings.extend(cloud_init_warnings)
         if cloud_init_config:
-            self.client.update_vm_config(self.node, vmid, **cloud_init_config)
+            self.client.update_vm_config(deployment_node, vmid, **cloud_init_config)
 
         start_task = None
         if vm.start:
-            start_task = self.client.start_vm(self.node, vmid)
-            self.client.wait_for_task(self.node, start_task)
+            start_task = self.client.start_vm(deployment_node, vmid)
+            self.client.wait_for_task(deployment_node, start_task)
+
+        ip_result = self._resolve_vm_ips(deployment_node, vmid, vm, warnings)
 
         return {
             "name": vm.name,
             "vmid": vmid,
             "template": vm.template,
             "source": source,
-            "node": self.node,
+            "storage": storage_id,
+            "node": deployment_node,
+            "source_node": source_node if vm.template is not None else deployment_node,
             "status": "created",
             "started": vm.start,
             "clone_task": clone_task,
             "create_task": create_task,
             "start_task": start_task,
+            "primary_ip": ip_result["primary_ip"],
+            "ip_addresses": ip_result["ip_addresses"],
+            "ip_status": ip_result["status"],
+            "network_interfaces": ip_result["interfaces"],
             "warnings": warnings,
             "bridges": [bridge.__dict__ for bridge in vm.bridges],
+        }
+
+    def _storage_id(self, storage_type: str) -> str:
+        if not storage_type:
+            raise ValueError("storage_type is required")
+        return str(storage_type).split(":", 1)[0]
+
+    def _optional_vm_config(self, vm: VmSpec) -> Dict[str, Any]:
+        return {
+            "agent": vm.agent,
+            "onboot": vm.onboot,
+            "tags": vm.tags,
+            "description": vm.description,
+        }
+
+    def _validate_template(self, node: str, template_vmid: int) -> None:
+        try:
+            template_config = self.client.vm_config(node, template_vmid)
+        except ProxmoxAPIError as exc:
+            raise ValueError(
+                f"Template VMID {template_vmid} was not found on node '{node}'. "
+                "Use a VM/template ID from Proxmox inventory, not the Proxmox API port."
+            ) from exc
+
+        if not template_config:
+            raise ValueError(
+                f"Template VMID {template_vmid} returned an empty config on node '{node}'."
+            )
+
+    def _resolve_vm_ips(
+        self,
+        node: str,
+        vmid: int,
+        vm: VmSpec,
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        static_ips = [
+            bridge.ip for bridge in vm.bridges
+            if bridge.type == "custom" and bridge.ip
+        ]
+
+        if not vm.start:
+            return {
+                "status": "not_started",
+                "primary_ip": static_ips[0] if static_ips else None,
+                "ip_addresses": static_ips,
+                "interfaces": [],
+            }
+
+        if not vm.wait_for_ip:
+            return {
+                "status": "skipped",
+                "primary_ip": static_ips[0] if static_ips else None,
+                "ip_addresses": static_ips,
+                "interfaces": [],
+            }
+
+        deadline = time.time() + max(vm.ip_wait_timeout, 0)
+        last_error = None
+
+        while time.time() <= deadline:
+            try:
+                interfaces = self.client.vm_network_interfaces(node, vmid)
+                parsed = self._parse_guest_interfaces(interfaces)
+                if parsed["ip_addresses"]:
+                    return {
+                        "status": "ready",
+                        "primary_ip": parsed["ip_addresses"][0],
+                        "ip_addresses": parsed["ip_addresses"],
+                        "interfaces": parsed["interfaces"],
+                    }
+            except ProxmoxAPIError as exc:
+                last_error = exc
+
+            time.sleep(max(vm.ip_poll_interval, 1))
+
+        if last_error:
+            warnings.append(
+                "VM IP was not available from QEMU guest agent before timeout: "
+                f"{last_error}"
+            )
+        else:
+            warnings.append("VM IP was not available from QEMU guest agent before timeout.")
+
+        return {
+            "status": "pending",
+            "primary_ip": static_ips[0] if static_ips else None,
+            "ip_addresses": static_ips,
+            "interfaces": [],
+        }
+
+    def _parse_guest_interfaces(self, payload: Any) -> Dict[str, Any]:
+        interfaces = payload.get("result", payload) if isinstance(payload, dict) else payload
+        if not isinstance(interfaces, list):
+            return {"ip_addresses": [], "interfaces": []}
+
+        parsed_interfaces = []
+        ip_addresses = []
+
+        for interface in interfaces:
+            if not isinstance(interface, dict):
+                continue
+            name = interface.get("name")
+            addresses = []
+            for item in interface.get("ip-addresses", []):
+                if item.get("ip-address-type") != "ipv4":
+                    continue
+                ip_address = item.get("ip-address")
+                if not ip_address or ip_address.startswith("127.") or ip_address.startswith("169.254."):
+                    continue
+                addresses.append(ip_address)
+                ip_addresses.append(ip_address)
+            if addresses:
+                parsed_interfaces.append({"name": name, "ipv4": addresses})
+
+        return {
+            "ip_addresses": ip_addresses,
+            "interfaces": parsed_interfaces,
         }
 
     def _build_nic_config(self, bridges: List[BridgeSpec]) -> Dict[str, str]:

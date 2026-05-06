@@ -19,11 +19,12 @@ COPY katana-prometheus/vim_targets.json /targets/vim_targets.json
 
 # Copy application files
 COPY katana-nbi/. .
+COPY ["Proxmox Standalone/", "/proxmox-standalone/"]
 
 # Upgrade pip and install Python dependencies
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
 # Command to run the application
-CMD ["gunicorn", "-b", "0.0.0.0:8000", "--access-logfile", "-", "--reload", "katana.app:create_app()"]
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "--timeout", "600", "--access-logfile", "-", "--reload", "katana.app:create_app()"]
 ENV CURL_CA_BUNDLE=

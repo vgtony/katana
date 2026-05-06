@@ -51,7 +51,7 @@ services:
       context: .
       dockerfile: katana-nbi/Dockerfile
     container_name: katana-nbi
-    command: gunicorn -b 0.0.0.0:8000 --workers 3 --access-logfile - --reload "katana.app:create_app()"
+    command: gunicorn -b 0.0.0.0:8000 --workers 3 --timeout 600 --access-logfile - --reload "katana.app:create_app()"
     volumes:
       - "katana-prom-targets:/targets"
     ports:

@@ -86,27 +86,33 @@ class ProxmoxVEClient:
             verify=self.verify_ssl,
             headers={"Accept": "application/json"},
         )
-        payload = self._decode_response(response)
+        payload = self._decode_response(response, "POST", "access/ticket")
         self._ticket = payload["ticket"]
         self._csrf_token = payload["CSRFPreventionToken"]
         self.session.cookies.set("PVEAuthCookie", self._ticket)
 
-    def _decode_response(self, response: requests.Response) -> Any:
+    def _decode_response(self, response: requests.Response, method: str, path: str) -> Any:
         try:
             payload = response.json()
         except ValueError as exc:
             raise ProxmoxAPIError(
-                f"Unexpected response from Proxmox ({response.status_code}): {response.text}"
+                f"Unexpected response from Proxmox for {method.upper()} {path} "
+                f"({response.status_code}): {response.text}"
             ) from exc
 
         if not response.ok:
             message = None
             if isinstance(payload, dict):
                 errors = payload.get("errors")
-                message = payload.get("message") or payload.get("error")
+                message = payload.get("message") or payload.get("error") or payload.get("data")
                 if errors:
                     message = f"{message or 'Request failed'}: {errors}"
-            raise ProxmoxAPIError(message or f"Proxmox API request failed with status {response.status_code}")
+            if not message:
+                message = response.text
+            raise ProxmoxAPIError(
+                f"Proxmox API request failed for {method.upper()} {path} "
+                f"with status {response.status_code}: {message}"
+            )
 
         if isinstance(payload, dict) and "data" in payload:
             return payload["data"]
@@ -129,7 +135,7 @@ class ProxmoxVEClient:
             verify=self.verify_ssl,
             headers=self._headers(method),
         )
-        return self._decode_response(response)
+        return self._decode_response(response, method, path)
 
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return self.request("GET", path, params=params)
@@ -198,6 +204,10 @@ class ProxmoxVEClient:
         cores: int,
         scsihw: str = "virtio-scsi-pci",
         ostype: str = "l26",
+        disk: Optional[str] = None,
+        boot: Optional[str] = None,
+        bootdisk: Optional[str] = None,
+        extra_config: Optional[Dict[str, Any]] = None,
     ) -> Any:
         payload: Dict[str, Any] = {
             "vmid": int(vmid),
@@ -207,6 +217,14 @@ class ProxmoxVEClient:
             "scsihw": scsihw,
             "ostype": ostype,
         }
+        if disk:
+            payload["scsi0"] = disk
+        if boot:
+            payload["boot"] = boot
+        if bootdisk:
+            payload["bootdisk"] = bootdisk
+        if extra_config:
+            payload.update({key: value for key, value in extra_config.items() if value is not None})
         return self.post(f"nodes/{node}/qemu", data=payload)
 
     def update_vm_config(self, node: str, vmid: int, **kwargs: Any) -> Any:
@@ -224,6 +242,9 @@ class ProxmoxVEClient:
 
     def vm_config(self, node: str, vmid: int) -> Any:
         return self.get(f"nodes/{node}/qemu/{int(vmid)}/config")
+
+    def vm_network_interfaces(self, node: str, vmid: int) -> Any:
+        return self.get(f"nodes/{node}/qemu/{int(vmid)}/agent/network-get-interfaces")
 
     def task_status(self, node: str, upid: str) -> Dict[str, Any]:
         return self.get(f"nodes/{node}/tasks/{upid}/status")

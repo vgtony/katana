@@ -2,12 +2,15 @@ import logging
 from logging import handlers
 import json
 import ipaddress
+import re
+import sys
 import time
 import urllib3
 import random
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from pathlib import Path
 
 from flask import request
 from flask_classful import FlaskView, route
@@ -19,6 +22,35 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Thread lock for VM ID generation
 vm_id_lock = threading.Lock()
+BRIDGE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[0-9]+)?$")
+
+
+def _ensure_standalone_import_path():
+    """
+    Make the reusable standalone Proxmox modules importable in local and Docker runs.
+    """
+    candidate_paths = [
+        Path("/proxmox-standalone"),
+        Path(__file__).resolve().parents[3] / "Proxmox Standalone",
+    ]
+    for path in candidate_paths:
+        if path.exists() and str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+
+
+def _validate_bridge_name(bridge_name):
+    if not bridge_name:
+        return "Bridge name is required"
+    if ":" in bridge_name:
+        return f"Bridge '{bridge_name}' is invalid. Use 'vmbr1' or 'vmbr1.<vlan_id>', not ':'."
+    if not BRIDGE_NAME_RE.match(bridge_name):
+        return f"Bridge '{bridge_name}' is invalid. Allowed format is bridge or bridge.<vlan_id>."
+    if "." in bridge_name:
+        vlan = bridge_name.split(".", 1)[1]
+        vlan_id = int(vlan)
+        if vlan_id < 1 or vlan_id > 4094:
+            return f"Bridge '{bridge_name}' has invalid VLAN '{vlan}'. VLAN must be 1-4094."
+    return None
 
 # Logging Parameters
 logger = logging.getLogger(__name__)
@@ -73,6 +105,81 @@ class ProxmoxView(FlaskView):
         except Exception as e:
             logger.error(f"Failed to connect to Proxmox: {str(e)}")
             return {"success": False, "message": str(e)}
+
+    def _standalone_components(self):
+        """
+        Load the standalone Proxmox modules used by the direct Katana API routes.
+        """
+        _ensure_standalone_import_path()
+        from proxmox_standalone.client import ProxmoxVEClient
+        from proxmox_standalone.provisioner import ProxmoxProvisioner
+        from proxmox_standalone.reporting import build_cluster_overview
+
+        return ProxmoxVEClient, ProxmoxProvisioner, build_cluster_overview
+
+    def _standalone_cluster_config(self, data):
+        """
+        Build a standalone-compatible cluster config from direct credentials or a saved cluster.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("Request body must be a JSON object")
+
+        config = dict(data)
+        cluster_id = config.get("cluster_id")
+        cluster_name = config.get("cluster_name")
+
+        if cluster_id or (cluster_name and not config.get("url")):
+            if cluster_id:
+                cluster = mongoUtils.get(self.proxmox_collection, cluster_id)
+                if not cluster:
+                    raise ValueError(f"Proxmox cluster with ID '{cluster_id}' not found")
+            else:
+                cluster = None
+                for candidate in mongoUtils.index(self.proxmox_collection):
+                    if candidate.get("name") == cluster_name:
+                        cluster = candidate
+                        break
+                if not cluster:
+                    raise ValueError(f"Proxmox cluster with name '{cluster_name}' not found")
+
+            config.update(
+                {
+                    "name": cluster.get("name"),
+                    "url": cluster.get("url"),
+                    "username": cluster.get("username"),
+                    "password": cluster.get("password"),
+                    "node": config.get("node") or cluster.get("node"),
+                    "verify_ssl": config.get("verify_ssl", False),
+                    "timeout": config.get("timeout", 30),
+                }
+            )
+
+        if config.get("cluster_name") and not config.get("name"):
+            config["name"] = config["cluster_name"]
+
+        if not config.get("url"):
+            raise ValueError("Missing required field: url")
+
+        has_password_auth = config.get("username") and config.get("password")
+        has_token_auth = config.get("api_token_id") and config.get("api_token_secret")
+        if not has_password_auth and not has_token_auth:
+            raise ValueError(
+                "Missing credentials. Provide username/password or api_token_id/api_token_secret."
+            )
+
+        return config
+
+    def _standalone_client(self, data):
+        """
+        Create a direct Proxmox VE client using the standalone API input format.
+        """
+        client_cls, _, _ = self._standalone_components()
+        config = self._standalone_cluster_config(data)
+        return config, client_cls.from_config(config)
+
+    def _standalone_error_response(self, exc, status_code=400):
+        logger.error(f"Standalone Proxmox API error: {str(exc)}")
+        return {"error": str(exc)}, status_code
 
     def _test_connection(self, url, username, password, node):
         """
@@ -233,6 +340,184 @@ class ProxmoxView(FlaskView):
         except Exception as e:
             logger.error(f"Error deleting Proxmox cluster {cluster_id}: {str(e)}")
             return {"error": str(e)}, 500
+
+    @route("/test", methods=["POST"])
+    def standalone_test(self):
+        """
+        Validate direct Proxmox credentials and return basic cluster information.
+        """
+        try:
+            body = request.json or {}
+            config, client = self._standalone_client(body)
+            return {
+                "cluster": config.get("name"),
+                "authenticated": True,
+                "version": client.version(),
+                "nodes": client.list_nodes(),
+            }, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/connect", methods=["POST"])
+    def standalone_connect(self):
+        """
+        UI-friendly Proxmox connection endpoint that returns available nodes.
+        """
+        return self.standalone_test()
+
+    @route("/nodes", methods=["POST"])
+    def standalone_nodes(self):
+        """
+        Return available Proxmox nodes for the provided credentials or saved cluster.
+        """
+        try:
+            body = request.json or {}
+            config, client = self._standalone_client(body)
+            return {
+                "cluster": config.get("name"),
+                "nodes": client.list_nodes(),
+            }, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/list-vms", methods=["POST"])
+    def standalone_list_vms(self):
+        """
+        Return raw VM inventory for a selected Proxmox node.
+        """
+        try:
+            body = request.json or {}
+            config, client = self._standalone_client(body)
+            node = request.args.get("node") or body.get("node") or config.get("node")
+            if not node:
+                raise ValueError(
+                    "Missing 'node'. Call /api/proxmox/connect or /api/proxmox/nodes first, then pass the selected node."
+                )
+
+            return {
+                "cluster": config.get("name"),
+                "node": node,
+                "vms": client.list_vms(node),
+            }, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    def _standalone_overview(self, body):
+        config, client = self._standalone_client(body)
+        _, _, build_cluster_overview = self._standalone_components()
+        return build_cluster_overview(client, cluster_name=config.get("name", ""))
+
+    @route("/overview", methods=["POST"])
+    def standalone_overview(self):
+        """
+        Return clusters, servers, VMs, usage, and remaining resources.
+        """
+        try:
+            return self._standalone_overview(request.json or {}), 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/clusters", methods=["POST"])
+    def standalone_clusters(self):
+        """
+        Return only cluster metadata and summary from the standalone overview.
+        """
+        try:
+            overview = self._standalone_overview(request.json or {})
+            return {"clusters": overview["clusters"]}, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/servers", methods=["POST"])
+    def standalone_servers(self):
+        """
+        Return only Proxmox nodes/servers from the standalone overview.
+        """
+        try:
+            overview = self._standalone_overview(request.json or {})
+            return {"servers": overview["servers"]}, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/vms", methods=["POST"])
+    def standalone_vms(self):
+        """
+        Return only VMs from the standalone overview payload.
+        """
+        try:
+            overview = self._standalone_overview(request.json or {})
+            return {"vms": overview["vms"]}, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/usage", methods=["POST"])
+    def standalone_usage(self):
+        """
+        Return only cluster-wide resource usage from the standalone overview.
+        """
+        try:
+            overview = self._standalone_overview(request.json or {})
+            return {"usage": overview["usage"]}, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/remaining-resources", methods=["POST"])
+    def standalone_remaining_resources(self):
+        """
+        Return only remaining capacity from the standalone overview.
+        """
+        try:
+            overview = self._standalone_overview(request.json or {})
+            return {"remaining_resources": overview["remaining_resources"]}, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    def _standalone_provision_response(self):
+        body = request.json or {}
+        config, client = self._standalone_client(body)
+        if not config.get("node"):
+            raise ValueError("Missing required field: node")
+
+        _, provisioner_cls, _ = self._standalone_components()
+        provisioner = provisioner_cls(client, config)
+        return provisioner.provision_from_config(body)
+
+    @route("/provision", methods=["POST"])
+    def standalone_provision(self):
+        """
+        Provision VMs directly through Katana using the standalone clone-or-create workflow.
+        """
+        try:
+            return self._standalone_provision_response(), 201
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/deploy", methods=["POST"])
+    def standalone_deploy(self):
+        """
+        Alias for /api/proxmox/provision.
+        """
+        return self.standalone_provision()
 
     @route("/vm", methods=["POST"])
     def create_vm(self):
@@ -457,6 +742,10 @@ class ProxmoxView(FlaskView):
             for bridge in vm["bridges"]:
                 if "name" not in bridge or "type" not in bridge:
                     return {"valid": False, "message": "Bridge missing name or type"}
+
+                bridge_error = _validate_bridge_name(bridge["name"])
+                if bridge_error:
+                    return {"valid": False, "message": bridge_error}
                 
                 # Check if custom IP is properly configured
                 if bridge["type"] != "management":

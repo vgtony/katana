@@ -84,6 +84,10 @@ vms:
 - if `template` is present, the VM is cloned from that template
 - if `template` is omitted, a fresh VM is created on the selected storage
 
+For fresh VMs, the provisioner creates an empty disk. Set `start: false` unless the VM has boot media or a bootable disk prepared separately.
+
+When `wait_for_ip: true`, provisioning polls QEMU guest agent for IPv4 addresses and returns `primary_ip`, `ip_addresses`, `ip_status`, and `network_interfaces` in each VM result. This requires guest agent support inside the VM/template. IP polling is disabled by default; tune `ip_wait_timeout` and `ip_poll_interval` per VM when enabling it.
+
 ## Commands
 
 Test the connection:
