@@ -378,12 +378,46 @@ sudo katana proxmox add -f proxmox_cluster.yaml
 
 Example `proxmox_cluster.yaml`:
 ```yaml
-name: "MyCluster"
 url: "https://10.160.100.11:8006"
 username: "root@pam"
 password: "your_password"
-node: "proxmox-node-01"
 ```
+
+The standalone Katana API registration uses the same minimum fields:
+
+```bash
+curl -X POST http://localhost:8000/api/proxmox/cluster \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://10.160.100.11:8006",
+    "username": "root@pam",
+    "password": "your_password"
+  }'
+```
+
+Registration stores only the Proxmox connection details. It does not require a node or cluster/datacenter name. Katana reads the Proxmox cluster/datacenter name from the Proxmox API, so a cluster named `Antares` is returned by the backend and the user clicks it instead of typing it.
+
+Example registration response shape:
+
+```json
+{
+  "cluster_id": "saved-katana-id",
+  "cluster_name": "Antares",
+  "datacenters": [
+    {
+      "id": "cluster",
+      "name": "Antares",
+      "node_count": 3
+    }
+  ],
+  "nodes": [],
+  "servers": []
+}
+```
+
+After the user clicks a datacenter, call `/api/proxmox/connect` with the selected `datacenter_id` or `datacenter_name` to return the nodes and servers for that selection.
+
+If the same `url` is registered again, Katana validates the submitted credentials, refreshes the saved registration, and returns the existing `cluster_id` instead of a duplicate error. To log out/remove a saved Proxmox registration, call `DELETE /api/proxmox/cluster/<cluster_id>`.
 
 ### Creating VMs from YAML
 ```bash
@@ -445,7 +479,17 @@ curl -X POST http://localhost:8000/api/proxmox/provision \
   }'
 ```
 
-`template` is optional for this endpoint. If present, Katana clones that Proxmox template; if omitted or set to `null`, Katana creates a fresh VM with an empty disk on the selected storage. `storage_type` may be a plain Proxmox storage ID like `local-lvm` or a legacy value like `fast:vm`; Katana uses the storage ID before `:` when calling Proxmox. The same workflow is also available at `/api/proxmox/deploy`.
+`template` is optional for this endpoint. If present, Katana clones that Proxmox template; if omitted or set to `null`, Katana creates a fresh VM with an empty disk on the selected storage and attaches the selected ISO image as a CD-ROM. Fresh VM creation requires `iso_image`. `storage_type` may be a plain Proxmox storage ID like `local-lvm` or a legacy value like `fast:vm`; Katana uses the storage ID before `:` when calling Proxmox. The same workflow is also available at `/api/proxmox/deploy`.
+
+ISO lists are included in `POST /api/proxmox/overview` and `POST /api/proxmox/servers` under each server `storage_options[].iso_images`, so the UI can load servers, storage, capacity, and ISO choices in one response. The UI should use the returned `volid` as `iso_image`, for example:
+
+```json
+{
+  "volid": "local:iso/ubuntu-22.04-live-server-amd64.iso",
+  "name": "ubuntu-22.04-live-server-amd64.iso",
+  "storage": "local"
+}
+```
 
 Fresh VM example without a template:
 
@@ -461,6 +505,7 @@ curl -X POST http://localhost:8000/api/proxmox/provision \
         "ram": 2048,
         "storage_type": "local-lvm",
         "disk_size": 20,
+        "iso_image": "local:iso/ubuntu-22.04-live-server-amd64.iso",
         "start": false,
         "bridges": [
           {"name": "vmbr0", "type": "management"}
@@ -472,11 +517,25 @@ curl -X POST http://localhost:8000/api/proxmox/provision \
 
 For UI integration:
 
-1. Call `POST /api/proxmox/connect` with `url`, credentials, and optional `verify_ssl` to validate access and load node choices.
-2. Let the user choose a node, storage, and VM options from the returned Proxmox data.
-3. Call `POST /api/proxmox/provision` with either direct credentials or a saved `cluster_id` / `cluster_name`, plus `node` and `vms`.
-4. Use `template: <vmid>` for template clone deployments; omit `template` for fresh empty VMs.
-5. After deployment, refresh inventory with `POST /api/proxmox/list-vms?node=<node>` or `POST /api/proxmox/overview`.
+1. Register with `POST /api/proxmox/cluster` using only `url`, `username`, and `password`.
+2. Show `datacenters[]`; the display label is `datacenters[].name`, for example `Antares`.
+3. When the user clicks one, call `POST /api/proxmox/connect` with `cluster_id` and either `datacenter_id` or `datacenter_name`.
+4. Show the returned `nodes` and `servers`, then let the user choose a server/node, storage, and VM options.
+5. For fresh VM creation, require the user to choose one ISO `volid` from the selected storage's `iso_images`.
+6. Call `POST /api/proxmox/provision` with `cluster_id`, selected `node`, and `vms`.
+7. Use `template: <vmid>` for template clone deployments; omit `template` and include `iso_image` for fresh VM deployments.
+8. After deployment, refresh inventory with `POST /api/proxmox/list-vms?node=<node>` or `POST /api/proxmox/overview`.
+
+Datacenter click example:
+
+```bash
+curl -X POST http://localhost:8000/api/proxmox/connect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cluster_id": "saved-katana-id",
+    "datacenter_id": "cluster"
+  }'
+```
 
 The deployment request waits for Proxmox clone/create/start tasks to finish. UI clients should use a long request timeout and show progress/loading while the request is in flight.
 
@@ -503,7 +562,21 @@ Deployment responses include VM IP information when Proxmox guest-agent reports 
 }
 ```
 
-`ip_status` can be `ready`, `pending`, `not_started`, or `skipped`. For `ready`, show `primary_ip`. For `pending`, show the VM as deployed and display IP pending; the UI can refresh inventory later. IP detection is disabled by default because it requires the VM/template to be running with QEMU guest agent installed and enabled. Set `wait_for_ip: true` per VM only when guest-agent support is available. `ip_wait_timeout` and `ip_poll_interval` can tune this behavior.
+`ip_status` can be `ready`, `pending`, `not_started`, or `skipped`. For `ready`, show `primary_ip`. For `pending`, show the VM as deployed and display IP pending; the UI can refresh inventory later. Guest-agent IP detection is disabled by default because it requires the VM/template to be running with QEMU guest agent installed and enabled. Set `wait_for_ip: true` per VM only when guest-agent support is available. `ip_wait_timeout` and `ip_poll_interval` can tune this behavior.
+
+The UI can also poll Proxmox for the VM IP after deployment:
+
+```bash
+curl -X POST http://localhost:8000/api/proxmox/vm-ip \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cluster_name": "MyCluster",
+    "node": "pve-node-01",
+    "vmid": 123
+  }'
+```
+
+This endpoint reads IP information from Proxmox guest-agent data. The frontend should use the `vmid` returned by `/api/proxmox/provision`, then poll `/api/proxmox/vm-ip` until `ip_status` is `ready` or until its own timeout is reached.
 
 ### Proxmox CLI Commands
 ```bash

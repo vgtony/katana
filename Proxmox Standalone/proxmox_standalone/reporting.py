@@ -85,12 +85,75 @@ def _storage_option_block(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _iso_image_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    volid = item.get("volid", "")
+    return {
+        "volid": volid,
+        "name": volid.split("/", 1)[-1],
+        "storage": item.get("storage") or volid.split(":", 1)[0],
+        "format": item.get("format"),
+        "size": item.get("size"),
+        "ctime": item.get("ctime"),
+    }
+
+
+def _build_iso_index(
+    client: ProxmoxVEClient,
+    storage_entries: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    iso_index: Dict[str, List[Dict[str, Any]]] = {}
+    seen = set()
+
+    for item in storage_entries:
+        node = item.get("node")
+        storage = item.get("storage")
+        content = str(item.get("content", ""))
+        if not node or not storage or "iso" not in content.split(","):
+            continue
+        key = (node, storage)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        try:
+            iso_index[f"{node}:{storage}"] = [
+                _iso_image_payload(iso_item)
+                for iso_item in client.storage_content(node, storage, content="iso")
+            ]
+        except Exception as exc:
+            iso_index[f"{node}:{storage}"] = [
+                {
+                    "error": str(exc),
+                }
+            ]
+
+    return iso_index
+
+
+def _cluster_entries(cluster_status: Any) -> List[Dict[str, Any]]:
+    if not isinstance(cluster_status, list):
+        return []
+    return [
+        item
+        for item in cluster_status
+        if isinstance(item, dict) and item.get("type") == "cluster"
+    ]
+
+
+def _cluster_name(cluster_status: Any, fallback: str) -> str:
+    clusters = _cluster_entries(cluster_status)
+    if clusters:
+        return clusters[0].get("name") or clusters[0].get("id") or fallback
+    return fallback
+
+
 def build_cluster_overview(
     client: ProxmoxVEClient,
     cluster_name: str = "",
 ) -> Dict[str, Any]:
     version = client.version()
     cluster_status = client.cluster_status()
+    cluster_name = _cluster_name(cluster_status, cluster_name)
     cluster_resources = client.cluster_resources()
 
     node_entries = [item for item in cluster_resources if item.get("type") == "node"]
@@ -99,6 +162,7 @@ def build_cluster_overview(
         item for item in cluster_resources
         if item.get("type") == "storage" and item.get("storage")
     ]
+    iso_index = _build_iso_index(client, storage_entries)
 
     online_nodes = [item for item in node_entries if item.get("status") == "online"]
     running_vms = [item for item in vm_entries if item.get("status") == "running"]
@@ -120,16 +184,20 @@ def build_cluster_overview(
     used_vm_cpu_cores = sum(
         float(item.get("cpu", 0)) * float(item.get("maxcpu", 0)) for item in vm_entries
     )
-    cluster_storage_options = [
-        _storage_option_block(item)
-        for item in sorted(
-            storage_entries,
-            key=lambda entry: (
-                entry.get("storage", ""),
-                entry.get("node", ""),
-            ),
+    cluster_storage_options = []
+    for item in sorted(
+        storage_entries,
+        key=lambda entry: (
+            entry.get("storage", ""),
+            entry.get("node", ""),
+        ),
+    ):
+        storage_block = _storage_option_block(item)
+        storage_block["iso_images"] = iso_index.get(
+            f"{item.get('node')}:{item.get('storage')}",
+            [],
         )
-    ]
+        cluster_storage_options.append(storage_block)
 
     nodes: List[Dict[str, Any]] = []
     server_remaining_resources: List[Dict[str, Any]] = []
@@ -145,11 +213,16 @@ def build_cluster_overview(
         cpu_block = _cpu_block(cpu_fraction, total_cores)
         memory_block = _resource_block(used_mem, total_mem)
         disk_block = _resource_block(used_disk, total_disk)
-        node_storage_options = [
-            _storage_option_block(storage_item)
-            for storage_item in storage_entries
-            if storage_item.get("node") == node_name
-        ]
+        node_storage_options = []
+        for storage_item in storage_entries:
+            if storage_item.get("node") != node_name:
+                continue
+            storage_block = _storage_option_block(storage_item)
+            storage_block["iso_images"] = iso_index.get(
+                f"{storage_item.get('node')}:{storage_item.get('storage')}",
+                [],
+            )
+            node_storage_options.append(storage_block)
 
         nodes.append(
             {
@@ -268,7 +341,8 @@ def build_cluster_overview(
     return {
         "clusters": [
             {
-                "name": cluster_name or None,
+                "id": item.get("id"),
+                "name": item.get("name") or item.get("id") or cluster_name or None,
                 "version": version,
                 "status": cluster_status,
                 "summary": {
@@ -278,6 +352,7 @@ def build_cluster_overview(
                     "running_vm_count": len(running_vms),
                 },
             }
+            for item in (_cluster_entries(cluster_status) or [{"name": cluster_name}])
         ],
         "servers": nodes,
         "vms": vms,

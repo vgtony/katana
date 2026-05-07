@@ -168,6 +168,18 @@ class ProxmoxVEClient:
     def list_vms(self, node: str) -> Any:
         return self.get(f"nodes/{node}/qemu")
 
+    def list_storages(self, node: str) -> Any:
+        return self.get(f"nodes/{node}/storage")
+
+    def storage_content(
+        self,
+        node: str,
+        storage: str,
+        content: Optional[str] = None,
+    ) -> Any:
+        params = {"content": content} if content else None
+        return self.get(f"nodes/{node}/storage/{storage}/content", params=params)
+
     def next_vmid(self) -> int:
         return int(self.get("cluster/nextid"))
 

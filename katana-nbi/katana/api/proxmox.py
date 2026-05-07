@@ -11,6 +11,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import request
 from flask_classful import FlaskView, route
@@ -144,6 +145,7 @@ class ProxmoxView(FlaskView):
 
             config.update(
                 {
+                    "_id": cluster.get("_id"),
                     "name": cluster.get("name"),
                     "url": cluster.get("url"),
                     "username": cluster.get("username"),
@@ -159,6 +161,8 @@ class ProxmoxView(FlaskView):
 
         if not config.get("url"):
             raise ValueError("Missing required field: url")
+        if not config.get("name"):
+            config["name"] = self._default_cluster_name(config.get("url"))
 
         has_password_auth = config.get("username") and config.get("password")
         has_token_auth = config.get("api_token_id") and config.get("api_token_secret")
@@ -181,44 +185,158 @@ class ProxmoxView(FlaskView):
         logger.error(f"Standalone Proxmox API error: {str(exc)}")
         return {"error": str(exc)}, status_code
 
-    def _test_connection(self, url, username, password, node):
+    def _normalize_cluster_url(self, url):
+        value = (url or "").strip().rstrip("/")
+        if value and "://" not in value:
+            value = f"https://{value}"
+        return value
+
+    def _default_cluster_name(self, url):
+        parsed = urlparse(self._normalize_cluster_url(url))
+        return parsed.hostname or parsed.netloc or url
+
+    def _cluster_public_payload(self, cluster):
+        return {
+            "_id": cluster["_id"],
+            "name": cluster.get("name"),
+            "url": cluster.get("url"),
+            "username": cluster.get("username"),
+            "node": cluster.get("node"),
+            "status": self._check_cluster_connectivity(cluster),
+        }
+
+    def _server_choices_from_nodes(self, nodes):
+        servers = []
+        for item in nodes or []:
+            if not isinstance(item, dict):
+                continue
+            servers.append(
+                {
+                    "name": item.get("node"),
+                    "node": item.get("node"),
+                    "status": item.get("status"),
+                    "cpu": item.get("cpu"),
+                    "maxcpu": item.get("maxcpu"),
+                    "memory": item.get("mem"),
+                    "maxmem": item.get("maxmem"),
+                    "disk": item.get("disk"),
+                    "maxdisk": item.get("maxdisk"),
+                    "uptime": item.get("uptime"),
+                    "datacenter_id": item.get("datacenter_id"),
+                    "datacenter_name": item.get("datacenter_name"),
+                }
+            )
+        return servers
+
+    def _cluster_status_clusters(self, cluster_status):
+        if not isinstance(cluster_status, list):
+            return []
+        return [
+            item
+            for item in cluster_status
+            if isinstance(item, dict) and item.get("type") == "cluster"
+        ]
+
+    def _datacenter_id(self, config, item):
+        name = item.get("name") or item.get("id") or config.get("name")
+        return item.get("id") or config.get("_id") or config.get("cluster_id") or name
+
+    def _datacenter_choices(self, config, version, cluster_status):
+        cluster_entries = self._cluster_status_clusters(cluster_status)
+        if not cluster_entries:
+            cluster_entries = [
+                {
+                    "id": config.get("_id") or config.get("cluster_id") or config.get("name"),
+                    "name": config.get("name") or self._default_cluster_name(config.get("url")),
+                    "nodes": 0,
+                }
+            ]
+
+        datacenters = []
+        for item in cluster_entries:
+            datacenters.append(
+                {
+                    "id": self._datacenter_id(config, item),
+                    "name": item.get("name") or item.get("id"),
+                    "url": config.get("url"),
+                    "version": version,
+                    "node_count": item.get("nodes", 0),
+                    "quorate": item.get("quorate"),
+                }
+            )
+        return datacenters
+
+    def _selected_datacenter(self, config, datacenters):
+        selected_id = config.get("datacenter_id") or config.get("cluster_datacenter_id")
+        selected_name = config.get("datacenter_name") or config.get("cluster_datacenter_name")
+        if not selected_id and not selected_name:
+            return None
+
+        for item in datacenters:
+            if selected_id and str(item.get("id")) == str(selected_id):
+                return item
+            if selected_name and item.get("name") == selected_name:
+                return item
+
+        raise ValueError("Selected Proxmox datacenter was not found")
+
+    def _discovery_payload(self, config, client):
+        version = client.version()
+        cluster_status = client.cluster_status()
+        datacenters = self._datacenter_choices(config, version, cluster_status)
+        selected_datacenter = self._selected_datacenter(config, datacenters)
+        nodes = []
+        if selected_datacenter:
+            nodes = [
+                {
+                    **item,
+                    "datacenter_id": selected_datacenter.get("id"),
+                    "datacenter_name": selected_datacenter.get("name"),
+                }
+                for item in client.list_nodes()
+                if isinstance(item, dict)
+            ]
+        return {
+            "cluster": (
+                selected_datacenter.get("name")
+                if selected_datacenter
+                else datacenters[0].get("name")
+            ),
+            "authenticated": True,
+            "version": version,
+            "datacenters": datacenters,
+            "selected_datacenter": selected_datacenter,
+            "nodes": nodes,
+            "servers": self._server_choices_from_nodes(nodes),
+        }
+
+    def _test_connection(self, data):
         """
-        Test connection to a Proxmox cluster using proxmoxer
+        Test connection to a Proxmox cluster without requiring a selected node.
         """
         try:
-            # Extract host and port from URL
-            if "://" in url:
-                url = url.split("://")[1]  # Remove protocol
-            if ":" in url:
-                host, port = url.split(":")
-            else:
-                host = url
-                port = 8006
-            
-            # Create ProxmoxAPI connection with longer timeout
-            proxmox = ProxmoxAPI(
-                host, 
-                user=username, 
-                password=password,
-                port=int(port),
-                verify_ssl=False,
-                timeout=30  # 30 second timeout
-            )
-            
-            # Test connection by getting node status
-            node_status = proxmox.nodes(node).status.get()
-            
-            return {"success": True, "message": "Connection successful"}
+            config, client = self._standalone_client(data)
+            discovery = self._discovery_payload(config, client)
+            return {
+                "success": True,
+                "message": "Connection successful",
+                "discovery": discovery,
+            }
         except Exception as e:
             logger.error(f"Connection test failed: {str(e)}")
             return {"success": False, "message": str(e)}
 
     def _check_cluster_connectivity(self, cluster):
         """
-        Check if a cluster is reachable using proxmoxer
+        Check if a cluster is reachable using the standalone Proxmox client.
         """
-        connection_result = self._get_proxmox_connection(cluster)
-        return "online" if connection_result["success"] else "offline"
+        try:
+            _, client = self._standalone_client(cluster)
+            client.version()
+            return "online"
+        except Exception as e:
+            logger.warning(f"Proxmox cluster connectivity check failed: {str(e)}")
+            return "offline"
 
     @route("/cluster", methods=["GET"])
     def get_clusters(self):
@@ -230,16 +348,7 @@ class ProxmoxView(FlaskView):
             return_data = []
 
             for cluster in clusters:
-                # Don't return sensitive information
-                cluster_info = {
-                    "_id": cluster["_id"],
-                    "name": cluster["name"],
-                    "url": cluster["url"],
-                    "username": cluster["username"],
-                    "node": cluster["node"],
-                    "status": self._check_cluster_connectivity(cluster)
-                }
-                return_data.append(cluster_info)
+                return_data.append(self._cluster_public_payload(cluster))
             
             return json.dumps(return_data), 200
         except Exception as e:
@@ -256,17 +365,7 @@ class ProxmoxView(FlaskView):
             if not cluster:
                 return {"error": f"Proxmox cluster with ID {cluster_id} not found"}, 404
             
-            # Don't return sensitive information
-            cluster_info = {
-                "_id": cluster["_id"],
-                "name": cluster["name"],
-                "url": cluster["url"],
-                "username": cluster["username"],
-                "node": cluster["node"],
-                "status": self._check_cluster_connectivity(cluster)
-            }
-            
-            return json.dumps(cluster_info), 200
+            return json.dumps(self._cluster_public_payload(cluster)), 200
         except Exception as e:
             logger.error(f"Error retrieving Proxmox cluster {cluster_id}: {str(e)}")
             return {"error": str(e)}, 500
@@ -277,49 +376,85 @@ class ProxmoxView(FlaskView):
         Register a new Proxmox cluster
         """
         try:
-            data = request.json
+            data = request.json or {}
             
             # Validate required fields
-            required_fields = ["name", "url", "username", "password", "node"]
+            required_fields = ["url", "username", "password"]
             for field in required_fields:
                 if field not in data:
                     return {"error": f"Missing required field: {field}"}, 400
+
+            cluster_url = self._normalize_cluster_url(data["url"])
+            fallback_cluster_name = self._default_cluster_name(cluster_url)
             
-            # Check if cluster with same name already exists
+            # Re-registering the same Proxmox URL should refresh the saved credentials,
+            # not fail the UI flow with a duplicate-registration error.
+            existing_cluster = None
             existing_clusters = mongoUtils.index(self.proxmox_collection)
             for cluster in existing_clusters:
-                if cluster["name"] == data["name"]:
-                    return {"error": f"Cluster with name '{data['name']}' already exists"}, 409
+                if self._normalize_cluster_url(cluster.get("url")) == cluster_url:
+                    existing_cluster = cluster
+                    break
             
             # Test connection to the cluster
-            connection_test = self._test_connection(
-                data["url"], 
-                data["username"], 
-                data["password"],
-                data["node"]
-            )
+            connection_config = {
+                "name": fallback_cluster_name,
+                "url": cluster_url,
+                "username": data["username"],
+                "password": data["password"],
+                "verify_ssl": data.get("verify_ssl", False),
+                "timeout": data.get("timeout", 30),
+            }
+            connection_test = self._test_connection(connection_config)
             
             if not connection_test["success"]:
                 return {"error": f"Failed to connect to Proxmox cluster: {connection_test['message']}"}, 400
             
-            # Generate a unique ID for the cluster
-            import uuid
-            cluster_id = str(uuid.uuid4())
+            discovery = connection_test["discovery"]
+            discovery_cluster_name = discovery.pop("cluster", fallback_cluster_name)
+            cluster_id = existing_cluster["_id"] if existing_cluster else None
+
+            if not cluster_id:
+                # Generate a unique ID for the cluster
+                import uuid
+                cluster_id = str(uuid.uuid4())
             
             # Store the cluster information
             cluster_data = {
                 "_id": cluster_id,
-                "name": data["name"],
-                "url": data["url"],
+                "name": discovery_cluster_name,
+                "url": cluster_url,
                 "username": data["username"],
                 "password": data["password"],
-                "node": data["node"],
-                "created_at": time.time()
+                "verify_ssl": data.get("verify_ssl", False),
+                "timeout": data.get("timeout", 30),
+                "created_at": existing_cluster.get("created_at", time.time()) if existing_cluster else time.time(),
+                "updated_at": time.time(),
             }
-            
-            mongoUtils.add(self.proxmox_collection, cluster_data)
-            
-            return {"message": "Proxmox cluster registered successfully", "cluster_id": cluster_id}, 201
+
+            if existing_cluster:
+                mongoUtils.update(self.proxmox_collection, cluster_id, cluster_data)
+            else:
+                mongoUtils.add(self.proxmox_collection, cluster_data)
+
+            discovery["cluster_id"] = cluster_id
+
+            return {
+                "message": (
+                    "Proxmox cluster registration refreshed successfully"
+                    if existing_cluster
+                    else "Proxmox cluster registered successfully"
+                ),
+                "cluster_id": cluster_id,
+                "cluster_name": discovery_cluster_name,
+                "cluster": {
+                    "_id": cluster_id,
+                    "name": discovery_cluster_name,
+                    "url": cluster_url,
+                    "username": data["username"],
+                },
+                **discovery,
+            }, 200 if existing_cluster else 201
         except Exception as e:
             logger.error(f"Error registering Proxmox cluster: {str(e)}")
             return {"error": str(e)}, 500
@@ -349,12 +484,7 @@ class ProxmoxView(FlaskView):
         try:
             body = request.json or {}
             config, client = self._standalone_client(body)
-            return {
-                "cluster": config.get("name"),
-                "authenticated": True,
-                "version": client.version(),
-                "nodes": client.list_nodes(),
-            }, 200
+            return self._discovery_payload(config, client), 200
         except ValueError as e:
             return self._standalone_error_response(e, 400)
         except Exception as e:
@@ -411,7 +541,19 @@ class ProxmoxView(FlaskView):
     def _standalone_overview(self, body):
         config, client = self._standalone_client(body)
         _, _, build_cluster_overview = self._standalone_components()
-        return build_cluster_overview(client, cluster_name=config.get("name", ""))
+        overview = build_cluster_overview(client, cluster_name=config.get("name", ""))
+        overview["datacenters"] = [
+            {
+                "id": item.get("id") or config.get("_id") or config.get("cluster_id") or item.get("name"),
+                "name": item.get("name"),
+                "url": config.get("url"),
+                "version": item.get("version"),
+                "node_count": item.get("summary", {}).get("node_count", 0),
+                "online_node_count": item.get("summary", {}).get("online_node_count", 0),
+            }
+            for item in overview.get("clusters", [])
+        ]
+        return overview
 
     @route("/overview", methods=["POST"])
     def standalone_overview(self):
@@ -519,6 +661,83 @@ class ProxmoxView(FlaskView):
         """
         return self.standalone_provision()
 
+    def _parse_vm_interfaces(self, payload):
+        interfaces = payload.get("result", payload) if isinstance(payload, dict) else payload
+        if not isinstance(interfaces, list):
+            return {"primary_ip": None, "ip_addresses": [], "network_interfaces": []}
+
+        ip_addresses = []
+        network_interfaces = []
+
+        for interface in interfaces:
+            if not isinstance(interface, dict):
+                continue
+
+            addresses = []
+            for item in interface.get("ip-addresses", []):
+                if item.get("ip-address-type") != "ipv4":
+                    continue
+                ip_address = item.get("ip-address")
+                if not ip_address or ip_address.startswith("127.") or ip_address.startswith("169.254."):
+                    continue
+                addresses.append(ip_address)
+                ip_addresses.append(ip_address)
+
+            if addresses:
+                network_interfaces.append(
+                    {
+                        "name": interface.get("name"),
+                        "ipv4": addresses,
+                    }
+                )
+
+        return {
+            "primary_ip": ip_addresses[0] if ip_addresses else None,
+            "ip_addresses": ip_addresses,
+            "network_interfaces": network_interfaces,
+        }
+
+    @route("/vm-ip", methods=["POST"])
+    def standalone_vm_ip(self):
+        """
+        Return VM IP addresses from Proxmox QEMU guest-agent data.
+        """
+        try:
+            body = request.json or {}
+            config, client = self._standalone_client(body)
+            node = request.args.get("node") or body.get("node") or config.get("node")
+            vmid = body.get("vmid") or request.args.get("vmid")
+
+            if not node:
+                raise ValueError("Missing required field: node")
+            if not vmid:
+                raise ValueError("Missing required field: vmid")
+
+            try:
+                interfaces = client.vm_network_interfaces(node, int(vmid))
+                parsed = self._parse_vm_interfaces(interfaces)
+                ip_status = "ready" if parsed["primary_ip"] else "pending"
+                error = None
+            except Exception as e:
+                parsed = {"primary_ip": None, "ip_addresses": [], "network_interfaces": []}
+                ip_status = "pending"
+                error = str(e)
+
+            return {
+                "cluster": config.get("name"),
+                "node": node,
+                "vmid": int(vmid),
+                "primary_ip": parsed["primary_ip"],
+                "ip_addresses": parsed["ip_addresses"],
+                "ip_status": ip_status,
+                "network_interfaces": parsed["network_interfaces"],
+                "error": error,
+            }, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
     @route("/vm", methods=["POST"])
     def create_vm(self):
         """
@@ -590,7 +809,12 @@ class ProxmoxView(FlaskView):
                 return {"error": f"Failed to connect to Proxmox: {conn_result['message']}"}, 503
             
             proxmox = conn_result["connection"]
-            node = cluster["node"]
+            node = config_data.get("node") or cluster.get("node")
+            if not node:
+                return {
+                    "error": "Missing required field: node. Register Proxmox with url/username/password, then choose a node from /api/proxmox/connect or /api/proxmox/overview before deployment."
+                }, 400
+            cluster = {**cluster, "node": node}
             
             # Pre-allocate all VM IDs sequentially to avoid conflicts
             allocated_vm_ids = []
@@ -784,7 +1008,9 @@ class ProxmoxView(FlaskView):
                 raise Exception(f"Failed to connect to Proxmox: {conn_result['message']}")
             
             proxmox = conn_result["connection"]
-            node = cluster["node"]
+            node = cluster.get("node")
+            if not node:
+                raise ValueError("Missing required field: node")
             
             # Step 1: Use pre-assigned VM ID (no more race conditions!)
             if pre_assigned_vm_id:
@@ -1419,7 +1645,10 @@ echo "Configuration complete for eth{interface_index}"
                 return None
             
             proxmox = conn_result["connection"]
-            node = cluster["node"]
+            node = cluster.get("node")
+            if not node:
+                logger.warning("Cannot get VM IP because no default Proxmox node is stored")
+                return None
             
             # Wait for VM to boot and get IP via guest agent
             max_attempts = 12  # 2 minutes with 10-second intervals

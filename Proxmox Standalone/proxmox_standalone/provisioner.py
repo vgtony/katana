@@ -104,6 +104,7 @@ class VmSpec:
     wait_for_ip: bool = False
     ip_wait_timeout: int = 120
     ip_poll_interval: int = 5
+    iso_image: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "VmSpec":
@@ -122,6 +123,10 @@ class VmSpec:
             template = int(template)
             if template <= 0:
                 raise ValueError(f"VM '{data['name']}' template must be a positive VMID")
+        elif not data.get("iso_image"):
+            raise ValueError(
+                f"VM '{data['name']}' is a fresh VM and must include iso_image"
+            )
 
         cpu = int(data["cpu"])
         ram = int(data["ram"])
@@ -162,6 +167,7 @@ class VmSpec:
             wait_for_ip=data.get("wait_for_ip", False),
             ip_wait_timeout=int(data.get("ip_wait_timeout", 120)),
             ip_poll_interval=int(data.get("ip_poll_interval", 5)),
+            iso_image=data.get("iso_image"),
         )
 
 
@@ -212,6 +218,7 @@ class ProxmoxProvisioner:
             )
             self.client.wait_for_task(source_node, clone_task)
         else:
+            self._validate_iso_image(deployment_node, vm.iso_image)
             create_task = self.client.create_vm(
                 node=deployment_node,
                 vmid=vmid,
@@ -221,13 +228,16 @@ class ProxmoxProvisioner:
                 scsihw=vm.scsihw,
                 ostype=vm.ostype,
                 disk=f"{storage_id}:{vm.disk_size}",
-                boot=vm.boot or f"order={vm.bootdisk}",
+                boot=vm.boot or f"order=ide2;{vm.bootdisk}",
                 bootdisk=vm.bootdisk,
-                extra_config=self._optional_vm_config(vm),
+                extra_config={
+                    **self._optional_vm_config(vm),
+                    "ide2": f"{vm.iso_image},media=cdrom",
+                },
             )
             self.client.wait_for_task(deployment_node, create_task)
             warnings.append(
-                "Fresh VM was created with an empty disk. Attach/install an OS or provide boot media if it should boot immediately."
+                "Fresh VM was created with an empty disk and the selected ISO attached as cdrom."
             )
 
         self.client.update_vm_config(
@@ -270,6 +280,7 @@ class ProxmoxProvisioner:
             "template": vm.template,
             "source": source,
             "storage": storage_id,
+            "iso_image": vm.iso_image,
             "node": deployment_node,
             "source_node": source_node if vm.template is not None else deployment_node,
             "status": "created",
@@ -312,6 +323,30 @@ class ProxmoxProvisioner:
                 f"Template VMID {template_vmid} returned an empty config on node '{node}'."
             )
 
+    def _validate_iso_image(self, node: str, iso_image: Optional[str]) -> None:
+        if not iso_image:
+            raise ValueError("Fresh VM creation requires iso_image")
+        if ":" not in iso_image:
+            raise ValueError(
+                f"ISO image '{iso_image}' is invalid. Expected Proxmox volid like 'local:iso/file.iso'."
+            )
+
+        storage, _ = iso_image.split(":", 1)
+        try:
+            iso_items = self.client.storage_content(node, storage, content="iso")
+        except ProxmoxAPIError as exc:
+            raise ValueError(
+                f"Could not list ISO images on storage '{storage}' for node '{node}': {exc}"
+            ) from exc
+
+        for item in iso_items:
+            if item.get("volid") == iso_image:
+                return
+
+        raise ValueError(
+            f"ISO image '{iso_image}' was not found on storage '{storage}' for node '{node}'."
+        )
+
     def _resolve_vm_ips(
         self,
         node: str,
@@ -319,24 +354,19 @@ class ProxmoxProvisioner:
         vm: VmSpec,
         warnings: List[str],
     ) -> Dict[str, Any]:
-        static_ips = [
-            bridge.ip for bridge in vm.bridges
-            if bridge.type == "custom" and bridge.ip
-        ]
-
         if not vm.start:
             return {
                 "status": "not_started",
-                "primary_ip": static_ips[0] if static_ips else None,
-                "ip_addresses": static_ips,
+                "primary_ip": None,
+                "ip_addresses": [],
                 "interfaces": [],
             }
 
         if not vm.wait_for_ip:
             return {
                 "status": "skipped",
-                "primary_ip": static_ips[0] if static_ips else None,
-                "ip_addresses": static_ips,
+                "primary_ip": None,
+                "ip_addresses": [],
                 "interfaces": [],
             }
 
@@ -369,8 +399,8 @@ class ProxmoxProvisioner:
 
         return {
             "status": "pending",
-            "primary_ip": static_ips[0] if static_ips else None,
-            "ip_addresses": static_ips,
+            "primary_ip": None,
+            "ip_addresses": [],
             "interfaces": [],
         }
 
