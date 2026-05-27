@@ -97,8 +97,8 @@ class VmSpec:
     scsihw: str = "virtio-scsi-pci"
     boot: Optional[str] = None
     bootdisk: str = "scsi0"
-    agent: Optional[int] = None
-    onboot: Optional[int] = None
+    agent: Optional[int] = 1
+    onboot: Optional[int] = 1
     tags: Optional[str] = None
     description: Optional[str] = None
     wait_for_ip: bool = False
@@ -160,8 +160,8 @@ class VmSpec:
             scsihw=data.get("scsihw", "virtio-scsi-pci"),
             boot=data.get("boot"),
             bootdisk=data.get("bootdisk", "scsi0"),
-            agent=data.get("agent"),
-            onboot=data.get("onboot"),
+            agent=data.get("agent", 1),
+            onboot=data.get("onboot", 1),
             tags=data.get("tags"),
             description=data.get("description"),
             wait_for_ip=data.get("wait_for_ip", False),
@@ -203,6 +203,7 @@ class ProxmoxProvisioner:
         storage_id = self._storage_id(vm.storage_type)
         source_node = self.node
         deployment_node = vm.target or self.node
+        switch_to_disk_boot_after_start = False
 
         if vm.template is not None:
             self._validate_template(source_node, vm.template)
@@ -219,6 +220,7 @@ class ProxmoxProvisioner:
             self.client.wait_for_task(source_node, clone_task)
         else:
             self._validate_iso_image(deployment_node, vm.iso_image)
+            switch_to_disk_boot_after_start = vm.boot is None
             create_task = self.client.create_vm(
                 node=deployment_node,
                 vmid=vmid,
@@ -271,6 +273,15 @@ class ProxmoxProvisioner:
         if vm.start:
             start_task = self.client.start_vm(deployment_node, vmid)
             self.client.wait_for_task(deployment_node, start_task)
+            if switch_to_disk_boot_after_start:
+                self.client.update_vm_config(
+                    deployment_node,
+                    vmid,
+                    boot=f"order={vm.bootdisk};ide2",
+                )
+                warnings.append(
+                    "Fresh VM booted from ISO for first start; future boots prefer disk."
+                )
 
         ip_result = self._resolve_vm_ips(deployment_node, vmid, vm, warnings)
 

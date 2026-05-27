@@ -12,6 +12,8 @@ vms:
     template: "101"          # ID of the template to clone (replace with your template ID)
     cpu: 4                   # Number of CPU cores
     ram: 4096                # RAM in MB
+    agent: 1                 # Enable QEMU guest agent by default
+    onboot: 1                # Start automatically when the Proxmox node boots
     storage_type: "fast:vm"  # Storage type: Format is "storage_name:format" or just "storage_name"
     disk_size: 20            # Disk size in GB
     
@@ -33,6 +35,8 @@ vms:
     template: "101"
     cpu: 2
     ram: 2048
+    agent: 1
+    onboot: 1
     storage_type: "datastorage"
     disk_size: 30
     

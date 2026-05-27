@@ -1080,7 +1080,9 @@ class ProxmoxView(FlaskView):
                 try:
                     config_data = {
                         "cores": cpu,
-                        "memory": ram
+                        "memory": ram,
+                        "agent": vm_config.get("agent", 1),
+                        "onboot": vm_config.get("onboot", 1)
                     }
                     proxmox.nodes(node).qemu(next_vmid).config.put(**config_data)
                     logger.info("VM resources configured successfully")

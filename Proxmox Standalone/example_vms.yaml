@@ -3,6 +3,8 @@ vms:
     template: 9000
     cpu: 4
     ram: 4096
+    agent: 1
+    onboot: 1
     storage_type: "local-lvm"
     disk_size: 20
     start: true
@@ -25,6 +27,8 @@ vms:
     template: 9000
     cpu: 2
     ram: 2048
+    agent: 1
+    onboot: 1
     storage_type: "local-lvm"
     disk_size: 25
     start: true
