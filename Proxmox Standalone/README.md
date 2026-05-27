@@ -86,11 +86,13 @@ vms:
 
 For fresh VMs, the provisioner creates an empty disk. Set `start: false` unless the VM has boot media or a bootable disk prepared separately.
 
-Fresh VMs boot from the attached ISO for the first start (`order=ide2;<bootdisk>`). After the start task succeeds, the provisioner changes future boots to prefer disk (`order=<bootdisk>;ide2`) so an autoinstaller can reboot into the installed OS instead of looping back into the ISO. Override `boot` only when you need to manage boot order yourself.
+Fresh VMs default to disk-first boot order with the attached ISO as fallback (`order=<bootdisk>;ide2`). That lets an empty disk fall through to the installer media on first boot, while later boots prefer the installed OS on disk. During provisioning, the boot order is applied on the VM config before Katana issues the start request. Override `boot` only when you need to manage boot order yourself.
 
 QEMU guest agent is enabled in Proxmox VM config by default (`agent: 1`). Set `agent: 0` on a VM only when you need to opt out. The guest OS or template still needs `qemu-guest-agent` installed and running for agent-backed operations to work.
 
 VMs are also configured to start automatically when the Proxmox node boots (`onboot: 1`). Set `onboot: 0` on a VM when you need to opt out.
+
+To split boot configuration from startup, first call `POST /api/proxmox/vm-config` with fields like `boot`, `bootdisk`, and `onboot`, then call `POST /api/proxmox/vm-start` for the same `node` and `vmid`.
 
 When `wait_for_ip: true`, provisioning polls QEMU guest agent for IPv4 addresses and returns `primary_ip`, `ip_addresses`, `ip_status`, and `network_interfaces` in each VM result. This requires guest agent support inside the VM/template. IP polling is disabled by default; tune `ip_wait_timeout` and `ip_poll_interval` per VM when enabling it.
 

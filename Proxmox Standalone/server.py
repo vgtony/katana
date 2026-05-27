@@ -112,9 +112,29 @@ class ProxmoxHTTPRequestHandler(BaseHTTPRequestHandler):
                         "path": "/api/proxmox/list-vms",
                         "description": "Return raw VM list for a specific node",
                     },
+                    {
+                        "method": "POST",
+                        "path": "/api/proxmox/vm-config",
+                        "description": "Update config for an existing VM, including boot order",
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/api/proxmox/vm-start",
+                        "description": "Start an existing VM",
+                    },
                 ],
             },
         )
+
+    def _existing_vm_request(self, body, query):
+        client = self._load_client(body)
+        node = query.get("node", [body.get("node")])[0]
+        vmid = body.get("vmid") or query.get("vmid", [None])[0]
+        if not node:
+            raise ValueError("Missing required field: node")
+        if not vmid:
+            raise ValueError("Missing required field: vmid")
+        return client, node, int(vmid)
 
     def _route_request(self, method):
         parsed = urlparse(self.path)
@@ -190,6 +210,58 @@ class ProxmoxHTTPRequestHandler(BaseHTTPRequestHandler):
                     "cluster": body.get("name"),
                     "node": node,
                     "vms": client.list_vms(node),
+                },
+            )
+            return
+
+        if method == "POST" and path == "/api/proxmox/vm-config":
+            body = self._read_json_body()
+            query_params = parse_qs(parsed.query)
+            client, node, vmid = self._existing_vm_request(body, query_params)
+            allowed_fields = {
+                "boot",
+                "bootdisk",
+                "cores",
+                "memory",
+                "agent",
+                "onboot",
+                "tags",
+                "description",
+            }
+            updates = {key: body.get(key) for key in allowed_fields if body.get(key) is not None}
+            if not updates:
+                raise ValueError(
+                    "No VM config fields provided. Include at least one of: "
+                    "boot, bootdisk, cores, memory, agent, onboot, tags, description."
+                )
+
+            client.update_vm_config(node, vmid, **updates)
+            self._send_json(
+                200,
+                {
+                    "cluster": body.get("name"),
+                    "node": node,
+                    "vmid": vmid,
+                    "updated": updates,
+                    "status": "config_updated",
+                },
+            )
+            return
+
+        if method == "POST" and path == "/api/proxmox/vm-start":
+            body = self._read_json_body()
+            query_params = parse_qs(parsed.query)
+            client, node, vmid = self._existing_vm_request(body, query_params)
+            start_task = client.start_vm(node, vmid)
+            client.wait_for_task(node, start_task)
+            self._send_json(
+                200,
+                {
+                    "cluster": body.get("name"),
+                    "node": node,
+                    "vmid": vmid,
+                    "start_task": start_task,
+                    "status": "started",
                 },
             )
             return

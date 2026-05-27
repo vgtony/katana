@@ -203,8 +203,6 @@ class ProxmoxProvisioner:
         storage_id = self._storage_id(vm.storage_type)
         source_node = self.node
         deployment_node = vm.target or self.node
-        switch_to_disk_boot_after_start = False
-
         if vm.template is not None:
             self._validate_template(source_node, vm.template)
             clone_task = self.client.clone_vm(
@@ -220,7 +218,6 @@ class ProxmoxProvisioner:
             self.client.wait_for_task(source_node, clone_task)
         else:
             self._validate_iso_image(deployment_node, vm.iso_image)
-            switch_to_disk_boot_after_start = vm.boot is None
             create_task = self.client.create_vm(
                 node=deployment_node,
                 vmid=vmid,
@@ -230,7 +227,7 @@ class ProxmoxProvisioner:
                 scsihw=vm.scsihw,
                 ostype=vm.ostype,
                 disk=f"{storage_id}:{vm.disk_size}",
-                boot=vm.boot or f"order=ide2;{vm.bootdisk}",
+                boot=vm.boot or f"order={vm.bootdisk};ide2",
                 bootdisk=vm.bootdisk,
                 extra_config={
                     **self._optional_vm_config(vm),
@@ -269,19 +266,14 @@ class ProxmoxProvisioner:
         if cloud_init_config:
             self.client.update_vm_config(deployment_node, vmid, **cloud_init_config)
 
+        boot_config = self._boot_config(vm)
+        if boot_config:
+            self.client.update_vm_config(deployment_node, vmid, **boot_config)
+
         start_task = None
         if vm.start:
             start_task = self.client.start_vm(deployment_node, vmid)
             self.client.wait_for_task(deployment_node, start_task)
-            if switch_to_disk_boot_after_start:
-                self.client.update_vm_config(
-                    deployment_node,
-                    vmid,
-                    boot=f"order={vm.bootdisk};ide2",
-                )
-                warnings.append(
-                    "Fresh VM booted from ISO for first start; future boots prefer disk."
-                )
 
         ip_result = self._resolve_vm_ips(deployment_node, vmid, vm, warnings)
 
@@ -318,6 +310,12 @@ class ProxmoxProvisioner:
             "onboot": vm.onboot,
             "tags": vm.tags,
             "description": vm.description,
+        }
+
+    def _boot_config(self, vm: VmSpec) -> Dict[str, Any]:
+        return {
+            "boot": vm.boot or f"order={vm.bootdisk};ide2",
+            "bootdisk": vm.bootdisk,
         }
 
     def _validate_template(self, node: str, template_vmid: int) -> None:

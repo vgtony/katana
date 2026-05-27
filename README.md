@@ -481,6 +481,8 @@ curl -X POST http://localhost:8000/api/proxmox/provision \
 
 `template` is optional for this endpoint. If present, Katana clones that Proxmox template; if omitted or set to `null`, Katana creates a fresh VM with an empty disk on the selected storage and attaches the selected ISO image as a CD-ROM. Fresh VM creation requires `iso_image`. `storage_type` may be a plain Proxmox storage ID like `local-lvm` or a legacy value like `fast:vm`; Katana uses the storage ID before `:` when calling Proxmox. The same workflow is also available at `/api/proxmox/deploy`.
 
+Fresh VMs default to `boot=order=<bootdisk>;ide2`, so Proxmox tries the hard disk first and falls back to the attached ISO/CD-ROM if the disk is still empty. During provisioning, Katana persists that boot order on the VM config before it sends the start request, so the UI can continue using a single deploy call.
+
 ISO lists are included in `POST /api/proxmox/overview` and `POST /api/proxmox/servers` under each server `storage_options[].iso_images`, so the UI can load servers, storage, capacity, and ISO choices in one response. The UI should use the returned `volid` as `iso_image`, for example:
 
 ```json
@@ -577,6 +579,31 @@ curl -X POST http://localhost:8000/api/proxmox/vm-ip \
 ```
 
 This endpoint reads IP information from Proxmox guest-agent data. The frontend should use the `vmid` returned by `/api/proxmox/provision`, then poll `/api/proxmox/vm-ip` until `ip_status` is `ready` or until its own timeout is reached.
+
+To configure boot order first and start later, use two sequential requests:
+
+```bash
+curl -X POST http://localhost:8000/api/proxmox/vm-config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cluster_name": "MyCluster",
+    "node": "pve-node-01",
+    "vmid": 123,
+    "boot": "order=scsi0;ide2",
+    "bootdisk": "scsi0",
+    "onboot": 1
+  }'
+```
+
+```bash
+curl -X POST http://localhost:8000/api/proxmox/vm-start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cluster_name": "MyCluster",
+    "node": "pve-node-01",
+    "vmid": 123
+  }'
+```
 
 ### Proxmox CLI Commands
 ```bash

@@ -642,6 +642,19 @@ class ProxmoxView(FlaskView):
         provisioner = provisioner_cls(client, config)
         return provisioner.provision_from_config(body)
 
+    def _standalone_existing_vm(self):
+        body = request.json or {}
+        config, client = self._standalone_client(body)
+        node = request.args.get("node") or body.get("node") or config.get("node")
+        vmid = body.get("vmid") or request.args.get("vmid")
+
+        if not node:
+            raise ValueError("Missing required field: node")
+        if not vmid:
+            raise ValueError("Missing required field: vmid")
+
+        return body, config, client, node, int(vmid)
+
     @route("/provision", methods=["POST"])
     def standalone_provision(self):
         """
@@ -660,6 +673,64 @@ class ProxmoxView(FlaskView):
         Alias for /api/proxmox/provision.
         """
         return self.standalone_provision()
+
+    @route("/vm-config", methods=["POST"])
+    def standalone_vm_config(self):
+        """
+        Update configuration for an existing VM, including boot order.
+        """
+        try:
+            body, _, client, node, vmid = self._standalone_existing_vm()
+            allowed_fields = {
+                "boot",
+                "bootdisk",
+                "cores",
+                "memory",
+                "agent",
+                "onboot",
+                "tags",
+                "description",
+            }
+            updates = {key: body.get(key) for key in allowed_fields if body.get(key) is not None}
+            if not updates:
+                raise ValueError(
+                    "No VM config fields provided. Include at least one of: "
+                    "boot, bootdisk, cores, memory, agent, onboot, tags, description."
+                )
+
+            client.update_vm_config(node, vmid, **updates)
+            return {
+                "cluster": body.get("name"),
+                "node": node,
+                "vmid": vmid,
+                "updated": updates,
+                "status": "config_updated",
+            }, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/vm-start", methods=["POST"])
+    def standalone_vm_start(self):
+        """
+        Start an existing VM after its configuration has been updated.
+        """
+        try:
+            body, _, client, node, vmid = self._standalone_existing_vm()
+            start_task = client.start_vm(node, vmid)
+            client.wait_for_task(node, start_task)
+            return {
+                "cluster": body.get("name"),
+                "node": node,
+                "vmid": vmid,
+                "start_task": start_task,
+                "status": "started",
+            }, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
 
     def _parse_vm_interfaces(self, payload):
         interfaces = payload.get("result", payload) if isinstance(payload, dict) else payload
