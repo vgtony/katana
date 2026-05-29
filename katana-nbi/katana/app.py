@@ -16,6 +16,7 @@ from katana.api import (
     BootstrapView,
     LocationView,
     AlertView,
+    AmarisoftSlicesView,
     K8SClusterView,
     LoTView,
     InitSGCView,
@@ -52,6 +53,7 @@ def create_app():
     BootstrapView.register(app, trailing_slash=False)
     LocationView.register(app, trailing_slash=False)
     AlertView.register(app, trailing_slash=False)
+    AmarisoftSlicesView.register(app, trailing_slash=False)
     LoTView.register(app, trailing_slash=False)
     K8SClusterView.register(app, trailing_slash=False)
     InitSGCView.register(app, trailing_slash=False)

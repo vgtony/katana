@@ -1,0 +1,13 @@
+[Unit]
+Description=Katana Amari CORE Adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/katana/amari-adapter/server.py --component core --port 8082 --state-file /var/lib/katana-amari-adapter/core-slices.json --dry-run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

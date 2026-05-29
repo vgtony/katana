@@ -1,5 +1,6 @@
 # katana/api/__init__.py
 from .alerts import AlertView
+from .amarisoft_slices import AmarisoftSlicesView
 from .bootstrap import BootstrapView
 from .pao_alert import PaoAlertView
 from .ems import EmsView
@@ -22,6 +23,7 @@ from .getTrustLevel import getTrustLevelView
 __all__ = [
     "LocationView",
     "AlertView",
+    "AmarisoftSlicesView",
     "BootstrapView",
     "PaoAlertView",
     "EmsView",
