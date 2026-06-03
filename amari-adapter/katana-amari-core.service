@@ -5,7 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/katana/amari-adapter/server.py --component core --port 8082 --state-file /var/lib/katana-amari-adapter/core-slices.json --dry-run
+Environment=AMARI_CORE_CONFIG=/root/ltemme-linux-2025-09-19/config/mme-ims.cfg
+Environment=AMARI_UE_DB_CONFIG=/root/ltemme-linux-2025-09-19/config/ue_db-ims.cfg
+Environment=AMARI_CORE_STATE_FILE=/var/lib/katana-amari-adapter/core-slices.json
+Environment=AMARI_BACKUP_DIR=/var/lib/katana-amari-adapter/backups
+Environment="AMARI_RESTART_CMD=/bin/systemctl restart lte"
+ExecStart=/usr/bin/python3 /opt/katana/amari-adapter/server.py --component core --port 8082 --state-file /var/lib/katana-amari-adapter/core-slices.json --active --apply-cmd /opt/katana/amari-adapter/apply-core-slice.sh --delete-cmd /opt/katana/amari-adapter/delete-core-slice.sh
 Restart=on-failure
 RestartSec=3
 

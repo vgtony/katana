@@ -5,7 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/katana/amari-adapter/server.py --component ran --port 8081 --state-file /var/lib/katana-amari-adapter/ran-slices.json --dry-run
+Environment=AMARI_RAN_CONFIG=/root/lteenb-linux-2025-09-19/config/gnb-sa.cfg
+Environment=AMARI_RAN_STATE_FILE=/var/lib/katana-amari-adapter/ran-slices.json
+Environment=AMARI_BACKUP_DIR=/var/lib/katana-amari-adapter/backups
+Environment="AMARI_RESTART_CMD=/bin/systemctl restart lte"
+ExecStart=/usr/bin/python3 /opt/katana/amari-adapter/server.py --component ran --port 8081 --state-file /var/lib/katana-amari-adapter/ran-slices.json --active --apply-cmd /opt/katana/amari-adapter/apply-ran-slice.sh --delete-cmd /opt/katana/amari-adapter/delete-ran-slice.sh
 Restart=on-failure
 RestartSec=3
 
