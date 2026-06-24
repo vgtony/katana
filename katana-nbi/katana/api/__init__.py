@@ -4,6 +4,8 @@ from .amarisoft_slices import AmarisoftSlicesView
 from .bootstrap import BootstrapView
 from .pao_alert import PaoAlertView
 from .ems import EmsView
+from .network_slices import NetworkSlicesView
+from .network_targets import NetworkTargetsView
 from.locations import LocationView
 from .function import FunctionView
 from .gst import GstView
@@ -27,6 +29,8 @@ __all__ = [
     "BootstrapView",
     "PaoAlertView",
     "EmsView",
+    "NetworkSlicesView",
+    "NetworkTargetsView",
     "FunctionView",
     "GstView",
     "NFVOView",
