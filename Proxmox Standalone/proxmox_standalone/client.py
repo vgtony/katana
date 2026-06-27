@@ -168,6 +168,28 @@ class ProxmoxVEClient:
     def list_vms(self, node: str) -> Any:
         return self.get(f"nodes/{node}/qemu")
 
+    def node_tasks(
+        self,
+        node: str,
+        start: Optional[int] = None,
+        limit: Optional[int] = None,
+        vmid: Optional[int] = None,
+        statusfilter: Optional[str] = None,
+        typefilter: Optional[str] = None,
+    ) -> Any:
+        params: Dict[str, Any] = {}
+        if start is not None:
+            params["start"] = int(start)
+        if limit is not None:
+            params["limit"] = int(limit)
+        if vmid is not None:
+            params["vmid"] = int(vmid)
+        if statusfilter:
+            params["statusfilter"] = statusfilter
+        if typefilter:
+            params["typefilter"] = typefilter
+        return self.get(f"nodes/{node}/tasks", params=params or None)
+
     def list_storages(self, node: str) -> Any:
         return self.get(f"nodes/{node}/storage")
 

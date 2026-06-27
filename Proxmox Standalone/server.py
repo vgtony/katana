@@ -114,6 +114,16 @@ class ProxmoxHTTPRequestHandler(BaseHTTPRequestHandler):
                     },
                     {
                         "method": "POST",
+                        "path": "/api/proxmox/tasks",
+                        "description": "Return recent Proxmox task history",
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/api/proxmox/task-log",
+                        "description": "Return log lines for one Proxmox task",
+                    },
+                    {
+                        "method": "POST",
                         "path": "/api/proxmox/vm-config",
                         "description": "Update config for an existing VM, including boot order",
                     },
@@ -210,6 +220,71 @@ class ProxmoxHTTPRequestHandler(BaseHTTPRequestHandler):
                     "cluster": body.get("name"),
                     "node": node,
                     "vms": client.list_vms(node),
+                },
+            )
+            return
+
+        if method == "POST" and path == "/api/proxmox/tasks":
+            body = self._read_json_body()
+            query_params = parse_qs(parsed.query)
+            client = self._load_client(body)
+            requested_node = query_params.get("node", [body.get("node")])[0]
+            limit = int(body.get("limit") or query_params.get("limit", [50])[0])
+            limit = min(max(limit, 1), 200)
+            vmid = body.get("vmid") or query_params.get("vmid", [None])[0]
+            statusfilter = body.get("statusfilter") or query_params.get("statusfilter", [None])[0]
+            typefilter = body.get("typefilter") or query_params.get("typefilter", [None])[0]
+            nodes = [requested_node] if requested_node else [
+                item.get("node") if isinstance(item, dict) else item
+                for item in client.list_nodes()
+                if (isinstance(item, dict) and item.get("node")) or isinstance(item, str)
+            ]
+
+            tasks = []
+            errors = []
+            for node in nodes:
+                try:
+                    for task in client.node_tasks(
+                        node,
+                        limit=limit,
+                        vmid=int(vmid) if vmid not in (None, "") else None,
+                        statusfilter=statusfilter,
+                        typefilter=typefilter,
+                    ):
+                        if isinstance(task, dict):
+                            tasks.append({"node": node, **task})
+                except Exception as exc:
+                    errors.append({"node": node, "error": str(exc)})
+
+            tasks.sort(key=lambda item: item.get("starttime") or 0, reverse=True)
+            self._send_json(
+                200,
+                {
+                    "cluster": body.get("name"),
+                    "tasks": tasks[:limit],
+                    "errors": errors,
+                },
+            )
+            return
+
+        if method == "POST" and path == "/api/proxmox/task-log":
+            body = self._read_json_body()
+            query_params = parse_qs(parsed.query)
+            client = self._load_client(body)
+            node = query_params.get("node", [body.get("node")])[0]
+            upid = body.get("upid") or query_params.get("upid", [None])[0]
+            if not node:
+                raise ValueError("Missing required field: node")
+            if not upid:
+                raise ValueError("Missing required field: upid")
+
+            self._send_json(
+                200,
+                {
+                    "cluster": body.get("name"),
+                    "node": node,
+                    "upid": upid,
+                    "log": client.task_log(node, upid),
                 },
             )
             return

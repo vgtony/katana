@@ -655,6 +655,93 @@ class ProxmoxView(FlaskView):
 
         return body, config, client, node, int(vmid)
 
+    def _safe_positive_int(self, value, default, maximum):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        if parsed < 1:
+            return default
+        return min(parsed, maximum)
+
+    def _proxmox_node_names(self, client):
+        nodes = []
+        for item in client.list_nodes():
+            if isinstance(item, dict) and item.get("node"):
+                nodes.append(item["node"])
+            elif isinstance(item, str):
+                nodes.append(item)
+        return nodes
+
+    @route("/tasks", methods=["POST"])
+    def standalone_tasks(self):
+        """
+        Return recent Proxmox task history for a saved cluster or direct credentials.
+        """
+        try:
+            body = request.json or {}
+            config, client = self._standalone_client(body)
+            requested_node = request.args.get("node") or body.get("node") or config.get("node")
+            limit = self._safe_positive_int(body.get("limit") or request.args.get("limit"), 50, 200)
+            vmid = body.get("vmid") or request.args.get("vmid")
+            statusfilter = body.get("statusfilter") or request.args.get("statusfilter")
+            typefilter = body.get("typefilter") or request.args.get("typefilter")
+            nodes = [requested_node] if requested_node else self._proxmox_node_names(client)
+
+            tasks = []
+            errors = []
+            for node in nodes:
+                try:
+                    node_tasks = client.node_tasks(
+                        node,
+                        limit=limit,
+                        vmid=int(vmid) if vmid not in (None, "") else None,
+                        statusfilter=statusfilter,
+                        typefilter=typefilter,
+                    )
+                    for task in node_tasks:
+                        if isinstance(task, dict):
+                            tasks.append({"node": node, **task})
+                except Exception as e:
+                    errors.append({"node": node, "error": str(e)})
+
+            tasks.sort(key=lambda item: item.get("starttime") or 0, reverse=True)
+            return {
+                "cluster": config.get("name"),
+                "tasks": tasks[:limit],
+                "errors": errors,
+            }, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
+    @route("/task-log", methods=["POST"])
+    def standalone_task_log(self):
+        """
+        Return log lines for one Proxmox task.
+        """
+        try:
+            body = request.json or {}
+            config, client = self._standalone_client(body)
+            node = request.args.get("node") or body.get("node") or config.get("node")
+            upid = body.get("upid") or request.args.get("upid")
+            if not node:
+                raise ValueError("Missing required field: node")
+            if not upid:
+                raise ValueError("Missing required field: upid")
+
+            return {
+                "cluster": config.get("name"),
+                "node": node,
+                "upid": upid,
+                "log": client.task_log(node, upid),
+            }, 200
+        except ValueError as e:
+            return self._standalone_error_response(e, 400)
+        except Exception as e:
+            return self._standalone_error_response(e, 502)
+
     @route("/provision", methods=["POST"])
     def standalone_provision(self):
         """
