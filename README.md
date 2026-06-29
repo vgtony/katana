@@ -81,6 +81,23 @@ In order to get the logs of the katana-mngr and katana-nbi modules run:
 katana logs [-l | --limit N]
 ```
 
+For frontend slice observability, the NBI also exposes slice-specific monitoring
+and log summary endpoints:
+
+```bash
+GET /api/slice/observability
+GET /api/slice/<SLICE_ID>/observability
+GET /api/slice/<SLICE_ID>/monitoring
+GET /api/slice/<SLICE_ID>/logs?limit=100
+```
+
+`/monitoring` returns Grafana dashboard metadata and Prometheus queries/results
+when slice monitoring is configured. `/logs` returns stored slice lifecycle
+events, runtime errors, and best-effort matching NBI `katana.log` lines. Set
+`KATANA_PUBLIC_GRAFANA_URL` or `KATANA_PUBLIC_PROMETHEUS_URL` if the frontend
+should link to externally routed monitoring URLs instead of the default host
+ports.
+
 ## Stop
 Stop Katana Slice Manager:
 

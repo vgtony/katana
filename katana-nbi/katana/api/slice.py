@@ -1,10 +1,13 @@
 import logging
+import os
 from logging import handlers
+from collections import deque
 import uuid
 
 from bson.json_util import dumps
 from flask import request
 from flask_classful import FlaskView, route
+import requests
 import urllib3
 
 from katana.shared_utils.kafkaUtils import kafkaUtils
@@ -33,6 +36,190 @@ class SliceView(FlaskView):
     urllib3.disable_warnings()
     route_prefix = "/api/"
 
+    def _public_service_url(self, env_name, default_port):
+        configured = os.getenv(env_name)
+        if configured:
+            return configured.rstrip("/")
+
+        host = request.host.split(":", 1)[0]
+        return f"{request.scheme}://{host}:{default_port}"
+
+    def _prometheus_url(self):
+        return os.getenv("KATANA_PROMETHEUS_URL", "http://katana-prometheus:9090").rstrip("/")
+
+    def _slice_name(self, islice):
+        return islice.get("slice_name") or islice.get("name") or islice["_id"]
+
+    def _slice_prometheus_queries(self, islice):
+        slice_id = islice["_id"]
+        metric_slice_id = "slice_" + slice_id.replace("-", "_")
+        queries = {
+            "slice_status": f'katana_status{{slice_id="{slice_id}"}}',
+            "network_services": f'ns_status{{slice_id="{slice_id}"}}',
+        }
+
+        if islice.get("slice_monitoring", {}).get("WIM"):
+            queries["wim_flows_per_second"] = f"rate({metric_slice_id}_flows[1m])"
+
+        return queries
+
+    def _query_prometheus(self, queries):
+        results = {}
+        prometheus_url = self._prometheus_url()
+        for name, query in queries.items():
+            try:
+                response = requests.get(
+                    f"{prometheus_url}/api/v1/query",
+                    params={"query": query},
+                    timeout=2,
+                )
+                response.raise_for_status()
+                results[name] = response.json()
+            except Exception as exc:
+                results[name] = {"status": "unavailable", "error": str(exc)}
+        return results
+
+    def _slice_observability_payload(self, islice, include_prometheus=False):
+        monitoring = islice.get("slice_monitoring") or {}
+        monitoring_configured = "slice_monitoring" in islice
+        dashboard_available = bool(monitoring)
+        dashboard_uid = islice["_id"] if dashboard_available else None
+        grafana_url = self._public_service_url("KATANA_PUBLIC_GRAFANA_URL", 3000)
+        prometheus_public_url = self._public_service_url("KATANA_PUBLIC_PROMETHEUS_URL", 9090)
+        queries = self._slice_prometheus_queries(islice) if monitoring_configured else {}
+
+        payload = {
+            "_id": islice["_id"],
+            "name": self._slice_name(islice),
+            "status": islice.get("status"),
+            "created_at": islice.get("created_at"),
+            "monitoring": {
+                "configured": monitoring_configured,
+                "dashboard_available": dashboard_available,
+                "details": monitoring,
+                "grafana": {
+                    "dashboard_uid": dashboard_uid,
+                    "dashboard_url": f"{grafana_url}/d/{dashboard_uid}" if dashboard_uid else None,
+                },
+                "prometheus": {
+                    "base_url": prometheus_public_url,
+                    "queries": queries,
+                },
+            },
+            "links": {
+                "details": f"/api/slice/{islice['_id']}",
+                "logs": f"/api/slice/{islice['_id']}/logs",
+                "monitoring": f"/api/slice/{islice['_id']}/monitoring",
+                "errors": f"/api/slice/{islice['_id']}/errors",
+                "deployment_time": f"/api/slice/{islice['_id']}/time",
+            },
+        }
+
+        if include_prometheus and queries:
+            payload["monitoring"]["prometheus"]["results"] = self._query_prometheus(queries)
+
+        return payload
+
+    def _slice_state_events(self, islice):
+        events = [
+            {
+                "source": "slice-record",
+                "level": "info",
+                "timestamp": islice.get("created_at"),
+                "message": "Slice created",
+                "slice_id": islice["_id"],
+            }
+        ]
+
+        for step, duration in (islice.get("deployment_time") or {}).items():
+            if duration is None:
+                continue
+            events.append(
+                {
+                    "source": "slice-record",
+                    "level": "info",
+                    "timestamp": None,
+                    "message": f"{step} completed in {duration} seconds",
+                    "slice_id": islice["_id"],
+                }
+            )
+
+        for ns_id, locations in (islice.get("ns_inst_info") or {}).items():
+            for location, info in locations.items():
+                status = info.get("status")
+                if not status:
+                    continue
+                events.append(
+                    {
+                        "source": "slice-record",
+                        "level": "info",
+                        "timestamp": None,
+                        "message": f"Network service {ns_id} at {location} is {status}",
+                        "slice_id": islice["_id"],
+                    }
+                )
+
+        runtime_errors = islice.get("runtime_errors") or {}
+        for key, value in runtime_errors.items():
+            events.append(
+                {
+                    "source": "slice-record",
+                    "level": "error",
+                    "timestamp": None,
+                    "message": f"Runtime error in {key}: {value}",
+                    "slice_id": islice["_id"],
+                }
+            )
+
+        events.append(
+            {
+                "source": "slice-record",
+                "level": "info",
+                "timestamp": None,
+                "message": f"Current slice status: {islice.get('status')}",
+                "slice_id": islice["_id"],
+            }
+        )
+        return events
+
+    def _local_slice_log_lines(self, slice_id, limit):
+        paths = ["katana.log"]
+        paths.extend(f"katana.log.{index}" for index in range(5, 0, -1))
+        lines = deque(maxlen=limit)
+
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, mode="r", encoding="utf-8", errors="replace") as log_file:
+                    for line in log_file:
+                        if slice_id in line:
+                            lines.append(
+                                {
+                                    "source": path,
+                                    "message": line.rstrip(),
+                                    "slice_id": slice_id,
+                                }
+                            )
+            except OSError as exc:
+                lines.append(
+                    {
+                        "source": path,
+                        "level": "warning",
+                        "message": f"Could not read log file: {exc}",
+                        "slice_id": slice_id,
+                    }
+                )
+
+        return list(lines)
+
+    def _request_limit(self, default=100, maximum=500):
+        try:
+            limit = int(request.args.get("limit", default))
+        except (TypeError, ValueError):
+            limit = default
+        return max(1, min(limit, maximum))
+
     def _validate_slice_payload(self, data):
         if not isinstance(data, dict):
             return "Error: Request body must be a JSON object", 400
@@ -60,6 +247,20 @@ class SliceView(FlaskView):
             return_data.append(dict(_id=islice["_id"], name=islice["slice_name"], created_at=islice["created_at"], status=islice["status"],))
         return dumps(return_data), 200
 
+    @route("/observability")
+    def observability_index(self):
+        """
+        Returns frontend-friendly monitoring/log links for all existing slices.
+        """
+        include_prometheus = request.args.get("include_prometheus") == "true"
+        slice_data = mongoUtils.index("slice")
+        return dumps(
+            [
+                self._slice_observability_payload(islice, include_prometheus=include_prometheus)
+                for islice in slice_data
+            ]
+        ), 200
+
     def get(self, uuid):
         """
         Returns the details of specific slice,
@@ -70,6 +271,62 @@ class SliceView(FlaskView):
             return dumps(data), 200
         else:
             return "Not Found", 404
+
+    @route("/<uuid>/observability")
+    def show_observability(self, uuid):
+        """
+        Returns frontend-friendly monitoring/log links for one slice.
+        """
+        islice = mongoUtils.get("slice", uuid)
+        if not islice:
+            return "Slice not found", 404
+
+        include_prometheus = request.args.get("include_prometheus", "true") != "false"
+        return dumps(
+            self._slice_observability_payload(islice, include_prometheus=include_prometheus)
+        ), 200
+
+    @route("/<uuid>/monitoring")
+    def show_monitoring(self, uuid):
+        """
+        Returns monitoring details for one slice.
+        """
+        islice = mongoUtils.get("slice", uuid)
+        if not islice:
+            return "Slice not found", 404
+
+        include_prometheus = request.args.get("include_prometheus", "true") != "false"
+        payload = self._slice_observability_payload(
+            islice,
+            include_prometheus=include_prometheus,
+        )
+        return dumps(payload["monitoring"]), 200
+
+    @route("/<uuid>/logs")
+    def show_logs(self, uuid):
+        """
+        Returns stored slice events, runtime errors, and best-effort matching NBI log lines.
+        """
+        islice = mongoUtils.get("slice", uuid)
+        if not islice:
+            return "Slice not found", 404
+
+        limit = self._request_limit()
+        payload = {
+            "_id": islice["_id"],
+            "name": self._slice_name(islice),
+            "status": islice.get("status"),
+            "events": self._slice_state_events(islice),
+            "log_lines": self._local_slice_log_lines(uuid, limit),
+            "log_count": None,
+            "limit": limit,
+            "note": (
+                "log_lines are best-effort matches from this API container's rotating "
+                "katana.log files. Manager/container log aggregation is not configured."
+            ),
+        }
+        payload["log_count"] = len(payload["log_lines"])
+        return dumps(payload), 200
 
     @route("/<uuid>/time")
     def show_time(self, uuid):
