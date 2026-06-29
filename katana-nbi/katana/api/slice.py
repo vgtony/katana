@@ -1,5 +1,7 @@
 import logging
 import os
+import re
+import time
 from logging import handlers
 from collections import deque
 import uuid
@@ -26,6 +28,36 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
+SLICE_STATUS = {
+    0: "Running",
+    1: "Placement",
+    2: "Provisioning",
+    3: "Activation",
+    10: "Terminating",
+    11: "Error",
+    12: "Deleted",
+}
+
+NS_STATUS = {
+    1: "Starting",
+    2: "Missing",
+    3: "Not running",
+    4: "Terminating",
+    5: "Admin stopped",
+}
+
+VM_PANELS = [
+    "vm_state",
+    "vm_cpu_cpu_time",
+    "vm_cpu_overall_cpu_usage",
+    "vm_memory_actual",
+    "vm_memory_available",
+    "vm_memory_usage",
+    "vm_disk_read_bytes",
+    "vm_disk_write_bytes",
+    "vm_disk_errors",
+]
+
 
 class SliceView(FlaskView):
     """
@@ -50,7 +82,7 @@ class SliceView(FlaskView):
     def _slice_name(self, islice):
         return islice.get("slice_name") or islice.get("name") or islice["_id"]
 
-    def _slice_prometheus_queries(self, islice):
+    def _slice_prometheus_queries(self, islice, include_infrastructure=False):
         slice_id = islice["_id"]
         metric_slice_id = "slice_" + slice_id.replace("-", "_")
         queries = {
@@ -61,7 +93,42 @@ class SliceView(FlaskView):
         if islice.get("slice_monitoring", {}).get("WIM"):
             queries["wim_flows_per_second"] = f"rate({metric_slice_id}_flows[1m])"
 
+        if include_infrastructure:
+            queries.update(self._slice_vm_prometheus_queries(islice))
         return queries
+
+    def _slice_vm_prometheus_queries(self, islice):
+        queries = {}
+        for vim_type, vm_list in self._slice_vm_targets(islice).items():
+            for panel in VM_PANELS:
+                key = f"{vim_type}_{panel}"
+                selectors = [
+                    f'project=~".*{islice["_id"]}"',
+                    f'vm_name=~"{self._prometheus_regex(vm_list)}"',
+                ]
+                queries[key] = f"{vim_type}_{panel}" + "{" + ",".join(selectors) + "}"
+        return queries
+
+    def _slice_vm_targets(self, islice):
+        targets = {}
+        for ns in (islice.get("ns_inst_info") or {}).values():
+            for value in ns.values():
+                vim_id = value.get("vim")
+                if not vim_id:
+                    continue
+                search_vim_id = vim_id[:-2] if value.get("shared", False) else vim_id
+                selected_vim = mongoUtils.find("vim", {"id": search_vim_id})
+                if not selected_vim:
+                    continue
+                vm_list = targets.get(selected_vim["type"], [])
+                for vnfr in value.get("vnfr") or []:
+                    vm_list.extend(vnfr.get("vm_list") or [])
+                if vm_list:
+                    targets[selected_vim["type"]] = sorted(set(vm_list))
+        return targets
+
+    def _prometheus_regex(self, values):
+        return "|".join(re.escape(str(value)).replace('"', '\\"') for value in values)
 
     def _query_prometheus(self, queries):
         results = {}
@@ -78,6 +145,113 @@ class SliceView(FlaskView):
             except Exception as exc:
                 results[name] = {"status": "unavailable", "error": str(exc)}
         return results
+
+    def _query_prometheus_range(self, query, start, end, step):
+        try:
+            response = requests.get(
+                f"{self._prometheus_url()}/api/v1/query_range",
+                params={"query": query, "start": start, "end": end, "step": step},
+                timeout=5,
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            return {"status": "unavailable", "error": str(exc)}
+
+    def _metric_value(self, result):
+        try:
+            return float(result["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+
+    def _metric_timestamp(self, result):
+        try:
+            return result["value"][0]
+        except (KeyError, IndexError, TypeError):
+            return None
+
+    def _prometheus_vector(self, result):
+        if result.get("status") != "success":
+            return []
+        return result.get("data", {}).get("result") or []
+
+    def _status_label(self, status_map, value):
+        if value is None:
+            return "Unknown"
+        try:
+            return status_map.get(int(value), "Unknown")
+        except (TypeError, ValueError):
+            return "Unknown"
+
+    def _monitoring_summary_payload(self, islice):
+        queries = (
+            self._slice_prometheus_queries(islice, include_infrastructure=True)
+            if "slice_monitoring" in islice
+            else {}
+        )
+        results = self._query_prometheus(queries) if queries else {}
+        slice_status = None
+        network_services = []
+        infrastructure = {}
+
+        for result in self._prometheus_vector(results.get("slice_status", {})):
+            value = self._metric_value(result)
+            slice_status = {
+                "value": value,
+                "label": self._status_label(SLICE_STATUS, value),
+                "timestamp": self._metric_timestamp(result),
+                "labels": result.get("metric", {}),
+            }
+
+        for result in self._prometheus_vector(results.get("network_services", {})):
+            value = self._metric_value(result)
+            network_services.append(
+                {
+                    "name": result.get("metric", {}).get("ns_name"),
+                    "value": value,
+                    "label": self._status_label(NS_STATUS, value),
+                    "timestamp": self._metric_timestamp(result),
+                    "labels": result.get("metric", {}),
+                }
+            )
+
+        for name, result in results.items():
+            if name in ("slice_status", "network_services", "wim_flows_per_second"):
+                continue
+            infrastructure[name] = [
+                {
+                    "vm_name": item.get("metric", {}).get("vm_name"),
+                    "value": self._metric_value(item),
+                    "timestamp": self._metric_timestamp(item),
+                    "labels": item.get("metric", {}),
+                }
+                for item in self._prometheus_vector(result)
+            ]
+
+        return {
+            "_id": islice["_id"],
+            "name": self._slice_name(islice),
+            "status": islice.get("status"),
+            "monitoring": {
+                "configured": "slice_monitoring" in islice,
+                "details": islice.get("slice_monitoring") or {},
+                "prometheus": {
+                    "base_url": self._public_service_url("KATANA_PUBLIC_PROMETHEUS_URL", 9090),
+                    "queries": queries,
+                    "unavailable": {
+                        name: result
+                        for name, result in results.items()
+                        if result.get("status") != "success"
+                    },
+                },
+            },
+            "metrics": {
+                "slice_status": slice_status,
+                "network_services": network_services,
+                "wim_flows_per_second": self._prometheus_vector(results.get("wim_flows_per_second", {})),
+                "infrastructure": infrastructure,
+            },
+        }
 
     def _slice_observability_payload(self, islice, include_prometheus=False):
         monitoring = islice.get("slice_monitoring") or {}
@@ -110,6 +284,9 @@ class SliceView(FlaskView):
                 "details": f"/api/slice/{islice['_id']}",
                 "logs": f"/api/slice/{islice['_id']}/logs",
                 "monitoring": f"/api/slice/{islice['_id']}/monitoring",
+                "monitoring_summary": f"/api/slice/{islice['_id']}/monitoring/summary",
+                "monitoring_range": f"/api/slice/{islice['_id']}/monitoring/range",
+                "alerts": f"/api/slice/{islice['_id']}/alerts",
                 "errors": f"/api/slice/{islice['_id']}/errors",
                 "deployment_time": f"/api/slice/{islice['_id']}/time",
             },
@@ -182,6 +359,33 @@ class SliceView(FlaskView):
         )
         return events
 
+    def _slice_alerts(self, slice_id, limit):
+        alerts = list(mongoUtils.find_all("alerts", {"slice_id": slice_id}))
+        alerts.sort(key=lambda alert: alert.get("received_at", 0), reverse=True)
+        return alerts[:limit]
+
+    def _slice_alert_events(self, slice_id, limit):
+        events = []
+        for alert in self._slice_alerts(slice_id, limit):
+            alert_name = alert.get("alertname") or alert.get("labels", {}).get("alertname")
+            status = alert.get("status") or "unknown"
+            ns_name = alert.get("labels", {}).get("ns_name")
+            message = f"Alert {alert_name} is {status}"
+            if ns_name:
+                message = f"{message} for {ns_name}"
+            events.append(
+                {
+                    "source": "alertmanager",
+                    "level": "warning" if status == "firing" else "info",
+                    "timestamp": alert.get("received_at"),
+                    "timestamp_iso": alert.get("received_at_iso"),
+                    "message": message,
+                    "slice_id": slice_id,
+                    "alert": alert,
+                }
+            )
+        return events
+
     def _local_slice_log_lines(self, slice_id, limit):
         paths = ["katana.log"]
         paths.extend(f"katana.log.{index}" for index in range(5, 0, -1))
@@ -219,6 +423,21 @@ class SliceView(FlaskView):
         except (TypeError, ValueError):
             limit = default
         return max(1, min(limit, maximum))
+
+    def _range_window(self):
+        now = time.time()
+        default_start = now - 3600
+        try:
+            start = float(request.args.get("start", default_start))
+        except (TypeError, ValueError):
+            start = default_start
+        try:
+            end = float(request.args.get("end", now))
+        except (TypeError, ValueError):
+            end = now
+        if end <= start:
+            end = start + 3600
+        return start, end, request.args.get("step", "30s")
 
     def _validate_slice_payload(self, data):
         if not isinstance(data, dict):
@@ -302,27 +521,89 @@ class SliceView(FlaskView):
         )
         return dumps(payload["monitoring"]), 200
 
+    @route("/<uuid>/monitoring/summary")
+    def show_monitoring_summary(self, uuid):
+        """
+        Returns frontend-ready current monitoring values for one slice.
+        """
+        islice = mongoUtils.get("slice", uuid)
+        if not islice:
+            return "Slice not found", 404
+
+        return dumps(self._monitoring_summary_payload(islice)), 200
+
+    @route("/<uuid>/monitoring/range")
+    def show_monitoring_range(self, uuid):
+        """
+        Returns Prometheus range values for one known slice metric query.
+        """
+        islice = mongoUtils.get("slice", uuid)
+        if not islice:
+            return "Slice not found", 404
+
+        metric = request.args.get("metric")
+        queries = (
+            self._slice_prometheus_queries(islice, include_infrastructure=True)
+            if "slice_monitoring" in islice
+            else {}
+        )
+        if not metric or metric not in queries:
+            return dumps({"error": "Unknown metric", "available_metrics": sorted(queries.keys())}), 400
+
+        start, end, step = self._range_window()
+        result = self._query_prometheus_range(queries[metric], start, end, step)
+        return dumps(
+            {
+                "_id": islice["_id"],
+                "metric": metric,
+                "query": queries[metric],
+                "start": start,
+                "end": end,
+                "step": step,
+                "result": result,
+            }
+        ), 200
+
+    @route("/<uuid>/alerts")
+    def show_alerts(self, uuid):
+        """
+        Returns stored Alertmanager events for one slice.
+        """
+        islice = mongoUtils.get("slice", uuid)
+        if not islice:
+            return "Slice not found", 404
+
+        return dumps(
+            {
+                "_id": islice["_id"],
+                "name": self._slice_name(islice),
+                "alerts": self._slice_alerts(uuid, self._request_limit()),
+            }
+        ), 200
+
     @route("/<uuid>/logs")
     def show_logs(self, uuid):
         """
-        Returns stored slice events, runtime errors, and best-effort matching NBI log lines.
+        Returns stored slice events, alerts, and best-effort matching NBI log lines.
         """
         islice = mongoUtils.get("slice", uuid)
         if not islice:
             return "Slice not found", 404
 
         limit = self._request_limit()
+        alert_events = self._slice_alert_events(uuid, limit)
         payload = {
             "_id": islice["_id"],
             "name": self._slice_name(islice),
             "status": islice.get("status"),
-            "events": self._slice_state_events(islice),
+            "events": self._slice_state_events(islice) + alert_events,
+            "alerts": [event["alert"] for event in alert_events],
             "log_lines": self._local_slice_log_lines(uuid, limit),
             "log_count": None,
             "limit": limit,
             "note": (
-                "log_lines are best-effort matches from this API container's rotating "
-                "katana.log files. Manager/container log aggregation is not configured."
+                "events include stored slice state and alert records. log_lines are "
+                "best-effort matches from this API container's rotating katana.log files."
             ),
         }
         payload["log_count"] = len(payload["log_lines"])

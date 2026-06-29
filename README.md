@@ -88,12 +88,19 @@ and log summary endpoints:
 GET /api/slice/observability
 GET /api/slice/<SLICE_ID>/observability
 GET /api/slice/<SLICE_ID>/monitoring
+GET /api/slice/<SLICE_ID>/monitoring/summary
+GET /api/slice/<SLICE_ID>/monitoring/range?metric=<METRIC>&start=<UNIX>&end=<UNIX>&step=30s
+GET /api/slice/<SLICE_ID>/alerts
 GET /api/slice/<SLICE_ID>/logs?limit=100
 ```
 
 `/monitoring` returns Grafana dashboard metadata and Prometheus queries/results
-when slice monitoring is configured. `/logs` returns stored slice lifecycle
-events, runtime errors, and best-effort matching NBI `katana.log` lines. Set
+when slice monitoring is configured. `/monitoring/summary` returns
+frontend-ready current values for slice, network-service, WIM, and VM metrics.
+`/monitoring/range` returns Prometheus range data for one metric key returned by
+the summary response. `/alerts` returns stored Alertmanager events for the
+slice. `/logs` returns stored slice lifecycle events, alert events, runtime
+errors, and best-effort matching NBI `katana.log` lines. Set
 `KATANA_PUBLIC_GRAFANA_URL` or `KATANA_PUBLIC_PROMETHEUS_URL` if the frontend
 should link to externally routed monitoring URLs instead of the default host
 ports.
