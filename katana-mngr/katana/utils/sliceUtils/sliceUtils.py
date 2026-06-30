@@ -52,6 +52,18 @@ NEST_KEYS_LIST = (
 )
 
 
+def slice_vim_account_name(slice_id, vim_index):
+    return f"katana_slice_{slice_id}_vim_{vim_index}"
+
+
+def shared_vim_account_name(sharing_list_id, vim_index):
+    return f"katana_shared_{sharing_list_id}_vim_{vim_index}"
+
+
+def added_ns_vim_account_name(slice_id):
+    return f"katana_slice_{slice_id}_added_ns_vim"
+
+
 def ns_details(
     ns_list, edge_loc, vim_dict, total_ns_list, shared_function=0, shared_slice_list_key=None,
 ):
@@ -275,10 +287,10 @@ def add_slice(nest_req):
 
         # Define project parameters
         if vim_info["shared"] == 1:
-            name = "vim_{0}_katana_{1}_shared".format(num, vim_info["shared_slice_list_key"])
+            vim_account_name = shared_vim_account_name(vim_info["shared_slice_list_key"], num)
             tenant_name = vim_info["shared_slice_list_key"]
         elif vim_info["shared"] == 0:
-            name = "vim_{0}_katana_{1}".format(num, nest["_id"])
+            vim_account_name = slice_vim_account_name(nest["_id"], num)
             tenant_name = nest["_id"]
         else:
             # Find the shared list
@@ -286,16 +298,16 @@ def add_slice(nest_req):
             vim_dict[vim] = sharing_lists["vims"][target_vim["id"]]
             mongoUtils.update("slice", nest["_id"], nest)
             continue
-        tenant_project_name = name
-        tenant_project_description = name
-        tenant_project_user = name
+        tenant_project_name = vim_account_name
+        tenant_project_description = vim_account_name
+        tenant_project_user = vim_account_name
         tenant_project_password = "password"
         # If the vim is Openstack type, set quotas
         quotas = vim_info["resources"] if target_vim["type"] == "openstack" or target_vim["type"] == "Openstack" else None
         logger.info(f"{nest['_id']} Status: Provisioning, Quotas: {quotas}")
         ids = target_vim_obj.create_slice_prerequisites(tenant_project_name, tenant_project_description, tenant_project_user, tenant_project_password, nest["_id"], quotas=quotas,)
         # Register the tenant to the mongo db
-        target_vim["tenants"][tenant_name] = name
+        target_vim["tenants"][tenant_name] = vim_account_name
         mongoUtils.update("vim", target_vim["_id"], target_vim)
 
         # STEP-2a-ii: Αdd the new VIM tenant to NFVO
@@ -986,17 +998,17 @@ def update_slice(nest_id, updates):
                         "resources": nsd["flavor"],
                         "nfvo_vim_account": {},
                     }
-                    name = f"vim_added_ns_{nest_id}"
+                    vim_account_name = added_ns_vim_account_name(nest_id)
                     tenant_name = nest["_id"]
-                    tenant_project_name = name
-                    tenant_project_description = name
-                    tenant_project_user = name
+                    tenant_project_name = vim_account_name
+                    tenant_project_description = vim_account_name
+                    tenant_project_user = vim_account_name
                     tenant_project_password = "password"
                     # If the vim is Openstack type, set quotas
                     quotas = nest["vim_list"][restart_ns["vim"]]["resources"] if target_vim["type"] == "openstack" or target_vim["type"] == "Openstack" else None
                     ids = target_vim_obj.create_slice_prerequisites(tenant_project_name, tenant_project_description, tenant_project_user, tenant_project_password, nest["_id"], quotas=quotas,)
                     # Register the tenant to the mongo db
-                    target_vim["tenants"][tenant_name] = name
+                    target_vim["tenants"][tenant_name] = vim_account_name
                     mongoUtils.update("vim", target_vim["_id"], target_vim)
                 else:
                     # Update the required resources
@@ -1010,17 +1022,17 @@ def update_slice(nest_id, updates):
                 # Check if the new VIM tenant must be added to the NFVO
                 nfvo_id = restart_ns["nfvo-id"]
                 if nfvo_id not in nest["vim_list"][restart_ns["vim"]]["nfvo_list"]:
-                    name = f"vim_added_ns_{nest_id}"
+                    vim_account_name = added_ns_vim_account_name(nest_id)
                     if target_vim["type"] == "openstack":
                         # Update the config parameter for the tenant
-                        config_param = dict(security_groups=name)
+                        config_param = dict(security_groups=vim_account_name)
                     elif target_vim["type"] == "opennebula":
                         config_param = target_vim["config"]
                     else:
                         config_param = {}
                     target_nfvo = mongoUtils.find("nfvo", {"id": nfvo_id})
                     target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": nfvo_id})["obj"])
-                    tenant_project_name = name
+                    tenant_project_name = vim_account_name
                     vim_id = target_nfvo_obj.addVim(tenant_project_name, target_vim["password"], target_vim["type"], target_vim["auth_url"], target_vim["username"], config_param,)
                     nest["vim_list"][restart_ns["vim"]]["nfvo_vim_account"][nfvo_id] = vim_id
                     # Register the tenant to the mongo db
@@ -1152,26 +1164,26 @@ def update_slice(nest_id, updates):
             target_vim = mongoUtils.find("vim", {"id": selected_vim_id})
             target_vim_obj = pickle.loads(mongoUtils.find("vim_obj", {"id": selected_vim_id})["obj"])
             if configure_vim_tenant:
-                name = f"vim_added_ns_{nest_id}"
+                vim_account_name = added_ns_vim_account_name(nest_id)
                 tenant_name = nest["_id"]
-                tenant_project_name = name
-                tenant_project_description = name
-                tenant_project_user = name
+                tenant_project_name = vim_account_name
+                tenant_project_description = vim_account_name
+                tenant_project_user = vim_account_name
                 tenant_project_password = "password"
                 # If the vim is Openstack type, set quotas
                 quotas = vim_dict[selected_vim_id]["resources"] if target_vim["type"] == "openstack" or target_vim["type"] == "Openstack" else None
                 ids = target_vim_obj.create_slice_prerequisites(tenant_project_name, tenant_project_description, tenant_project_user, tenant_project_password, nest["_id"], quotas=quotas,)
                 # Register the tenant to the mongo db
-                target_vim["tenants"][tenant_name] = name
+                target_vim["tenants"][tenant_name] = vim_account_name
                 mongoUtils.update("vim", target_vim["_id"], target_vim)
             else:
                 tenant_name = target_vim["tenants"][nest_id]
                 target_vim_obj.set_quotas(tenant_name, vim_dict[selected_vim_id]["resources"])
             if configure_nfvo_tenant:
-                name = f"vim_added_ns_{nest_id}"
+                vim_account_name = added_ns_vim_account_name(nest_id)
                 if target_vim["type"] == "openstack":
                     # Update the config parameter for the tenant
-                    config_param = dict(security_groups=name)
+                    config_param = dict(security_groups=vim_account_name)
                 elif target_vim["type"] == "opennebula":
                     config_param = target_vim["config"]
                 else:
@@ -1179,7 +1191,7 @@ def update_slice(nest_id, updates):
                 for nfvo_id in vim_dict[selected_vim_id]["nfvo_list"]:
                     target_nfvo = mongoUtils.find("nfvo", {"id": nfvo_id})
                     target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": nfvo_id})["obj"])
-                    tenant_project_name = name
+                    tenant_project_name = vim_account_name
                     vim_id = target_nfvo_obj.addVim(tenant_project_name, target_vim["password"], target_vim["type"], target_vim["auth_url"], target_vim["username"], config_param,)
                     vim_dict[selected_vim_id]["nfvo_vim_account"] = vim_dict[selected_vim_id].get("nfvo_vim_account", {})
                     vim_dict[selected_vim_id]["nfvo_vim_account"][nfvo_id] = vim_id
