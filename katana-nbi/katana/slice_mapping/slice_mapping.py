@@ -189,7 +189,7 @@ def nest_mapping(req):
         # Find the registered function for Core Function
         epc = mongoUtils.find("func", calc_find_data(gen, "core", 0))
         if not epc:
-            return "Error: Not available Core Network Functions", 400
+            return f"Error: Not available Core Network Function: required gen={gen}, func=0, location=core", 400
         # Check if the nest allows shareable functions, if the function is shareable
         if req_slice_des["isolation"] != 1 and req_slice_des["isolation"] != 3 and epc["shared"]["availability"]:
             found_list_key = None
@@ -249,7 +249,8 @@ def nest_mapping(req):
                 mongoUtils.update("func", enb["_id"], enb)
                 functions_list.append(enb["_id"])
         if not epc or not connections:
-            return "Error: Not available Network Functions", 400
+            missing_locations = ", ".join(not_supp_loc) if not_supp_loc else "no supported coverage locations"
+            return f"Error: Not available Radio Network Functions: required gen={gen}, func=1, locations={missing_locations}", 400
         epc["tenants"].append(nest["_id"])
         mongoUtils.update("func", epc["_id"], epc)
         functions_list.append(epc["_id"])
@@ -261,11 +262,16 @@ def nest_mapping(req):
         nest["sst"] = 2
         connections = []
         not_supp_loc = []
+        missing_functions = []
         for location in req_slice_des["coverage"]:
             epc = mongoUtils.find("func", calc_find_data(gen, location.lower(), 0))
             enb = mongoUtils.find("func", calc_find_data(gen, location.lower(), 1))
             if not epc or not enb:
                 not_supp_loc.append(location)
+                if not epc:
+                    missing_functions.append(f"Core(gen={gen}, func=0, location={location.lower()})")
+                if not enb:
+                    missing_functions.append(f"Radio(gen={gen}, func=1, location={location.lower()})")
             else:
                 # Check if the nest allows shareable functions, if the function is shareable
                 # For the Core function
@@ -323,7 +329,8 @@ def nest_mapping(req):
                 mongoUtils.update("func", epc["_id"], epc)
                 functions_list.extend([epc["_id"], enb["_id"]])
         if not connections:
-            return "Error: Not available Network Functions", 400
+            missing_details = "; ".join(missing_functions) if missing_functions else "no supported coverage locations"
+            return f"Error: Not available Network Functions: missing {missing_details}", 400
         for location in not_supp_loc:
             logger.warning(f"Location {location} not supported")
             req_slice_des["coverage"].remove(location)

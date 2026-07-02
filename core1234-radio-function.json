@@ -1,0 +1,20 @@
+{
+  "id": "core1234-radio-function-id",
+  "name": "core1234-radio-function-id",
+  "gen": 5,
+  "func": 1,
+  "shared": {
+    "availability": false
+  },
+  "type": 0,
+  "location": "core1234",
+  "pnf_list": [],
+  "ns_list": [
+    {
+      "nsd-id": "5c17d35a-0cd3-42a3-95c6-4dec4c27f906",
+      "ns-name": "hackfest_basic-ns",
+      "placement": 1,
+      "optional": false
+    }
+  ]
+}

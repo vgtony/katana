@@ -41,11 +41,11 @@ def get_vims(filter_data=None):
     return vims
 
 
-def get_func(filter_data={}):
+def get_func(filter_data=None):
     """
     Return the list of available Network Functions
     """
-    filter_data["type"] = 1
+    filter_data = dict(filter_data or {})
     data = mongoUtils.find_all("func", data=filter_data)
     functions = []
     for iserv in data:

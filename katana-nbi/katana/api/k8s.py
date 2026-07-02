@@ -250,6 +250,11 @@ class K8SClusterView(FlaskView):
                             osm_response = {"raw_response": response.text}
 
                         try:
+                            if isinstance(osm_response, dict):
+                                osm_cluster_id = osm_response.get("_id") or osm_response.get("id")
+                                if osm_cluster_id:
+                                    request.json["osm_id"] = osm_cluster_id
+
                             mongoUtils.add("k8sclusters", request.json)
                             logger.info(f"Successfully added Kubernetes cluster: {new_uuid}")
 
@@ -287,22 +292,33 @@ class K8SClusterView(FlaskView):
                 logger.warning(f"Cluster not found: {uuid}")
                 return f"Error: No such Kubernetes cluster: {uuid}", 404
 
-            # Fetch VIM account
-            vim_account = mongoUtils.get("vim_accounts", cluster["vim_account"])
-            if not vim_account:
-                logger.error(f"VIM account not found: {cluster['vim_account']}")
-                return f"Error: VIM account {cluster['vim_account']} not found", 404
+            nfvo_ip = cluster.get("nfvo_ip")
+            nfvo_username = cluster.get("nfvo_username")
+            nfvo_password = cluster.get("nfvo_password")
+            project_id = cluster.get("project_id", "admin")
+
+            if not nfvo_ip or not nfvo_username or not nfvo_password:
+                vim_account = mongoUtils.get("vim_accounts", cluster["vim_account"])
+                if not vim_account:
+                    logger.error(f"NFVO details not found for Kubernetes cluster: {uuid}")
+                    return f"Error: NFVO details not found for Kubernetes cluster: {uuid}", 404
+
+                nfvo_ip = vim_account["nfvo_ip"]
+                nfvo_username = vim_account["nfvousername"]
+                nfvo_password = vim_account["nfvopassword"]
+                project_id = vim_account.get("project_id", "admin")
 
             osm = osmUtils.Osm(
-                nfvo_id=vim_account["nfvo_id"],
-                ip=vim_account["nfvo_ip"],
-                username=vim_account["nfvousername"],
-                password=vim_account["nfvopassword"],
-                project_id=vim_account.get("project_id", "admin")
+                nfvo_id=cluster.get("nfvo_id", ""),
+                ip=nfvo_ip,
+                username=nfvo_username,
+                password=nfvo_password,
+                project_id=project_id
             )
             osm.getToken()
 
-            osm_url = f"https://{osm.ip}/osm/admin/v1/k8sclusters/{uuid}"
+            osm_cluster_id = cluster.get("osm_id", uuid)
+            osm_url = f"https://{osm.ip}/osm/admin/v1/k8sclusters/{osm_cluster_id}"
             headers = {"Authorization": f"Bearer {osm.token}"}
             response = requests.delete(osm_url, headers=headers, verify=False)
             logger.debug(f"OSM API response: {response.status_code}, {response.text}")
