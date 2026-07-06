@@ -94,6 +94,14 @@ def calc_find_data(gen, location, func):
         return {"location": location, "gen": 4, "func": func}
 
 
+def explicit_ns_list(req):
+    """
+    Return NSs explicitly requested by the service descriptor.
+    """
+    service_descriptor = req.get("service_descriptor") or {}
+    return service_descriptor.get("ns_list") or []
+
+
 def nest_mapping(req):
     """
     Function that maps nest to the underlying network functions
@@ -182,16 +190,25 @@ def nest_mapping(req):
     else:
         gen = 4
 
+    requested_ns_list = explicit_ns_list(req)
+
     # *** Calculate the type of the slice (sst) ***
     if req_slice_des["delay_tolerance"]:
         # EMBB
         nest["sst"] = 1
+        using_explicit_ns_mapping = False
         # Find the registered function for Core Function
         epc = mongoUtils.find("func", calc_find_data(gen, "core", 0))
         if not epc:
-            return f"Error: Not available Core Network Function: required gen={gen}, func=0, location=core", 400
+            if requested_ns_list:
+                logger.warning(
+                    "Core function gen=%s location=core not found; using explicit service_descriptor.ns_list",
+                    gen,
+                )
+            else:
+                return f"Error: Not available Core Network Function: required gen={gen}, func=0, location=core", 400
         # Check if the nest allows shareable functions, if the function is shareable
-        if req_slice_des["isolation"] != 1 and req_slice_des["isolation"] != 3 and epc["shared"]["availability"]:
+        if epc and req_slice_des["isolation"] != 1 and req_slice_des["isolation"] != 3 and epc["shared"]["availability"]:
             found_list_key = None
             max_len = epc["shared"].get("max_shared", 0)
             for grouped_nest_key, grouped_nest_list in epc["shared"]["sharing_list"].items():
@@ -215,54 +232,62 @@ def nest_mapping(req):
             nest["shared"]["core"] = {epc["_id"]: found_list_key}
         connections = []
         not_supp_loc = []
-        for location in req_slice_des["coverage"]:
-            enb = mongoUtils.find("func", calc_find_data(gen, location.lower(), 1))
-            if not enb:
-                not_supp_loc.append(location)
+        if epc:
+            for location in req_slice_des["coverage"]:
+                enb = mongoUtils.find("func", calc_find_data(gen, location.lower(), 1))
+                if not enb:
+                    not_supp_loc.append(location)
+                else:
+                    # Check if the nest allows shareable functions, if the function is shareable
+                    if req_slice_des["isolation"] < 2 and enb["shared"]["availability"]:
+                        found_list_key = None
+                        max_len = enb["shared"].get("max_shared", 0)
+                        for grouped_nest_key, grouped_nest_list in enb["shared"]["sharing_list"].items():
+                            if len(grouped_nest_list) < max_len or not max_len:
+                                found_list_key = grouped_nest_key
+                                grouped_nest_list.append(nest["_id"])
+                                sharing_list = mongoUtils.get("sharing_lists", found_list_key)
+                                sharing_list["nest_list"].append(nest["_id"])
+                                mongoUtils.update("sharing_lists", found_list_key, sharing_list)
+                                break
+                        if not found_list_key:
+                            found_list_key = str(uuid.uuid4())
+                            enb["shared"]["sharing_list"][found_list_key] = [nest["_id"]]
+                            data = {
+                                "_id": found_list_key,
+                                "nest_list": [nest["_id"]],
+                                "nsd_list": {},
+                                "ns_list": [],
+                            }
+                            mongoUtils.add("sharing_lists", data)
+                        nest["shared"]["radio"] = nest["shared"].get("radio", {})
+                        nest["shared"]["radio"][enb["_id"]] = found_list_key
+                    connections.append({"core": epc, "radio": enb})
+                    enb["tenants"].append(nest["_id"])
+                    mongoUtils.update("func", enb["_id"], enb)
+                    functions_list.append(enb["_id"])
+        if not connections:
+            if requested_ns_list:
+                using_explicit_ns_mapping = True
+                logger.warning("Radio function mapping not found; using explicit service_descriptor.ns_list")
             else:
-                # Check if the nest allows shareable functions, if the function is shareable
-                if req_slice_des["isolation"] < 2 and enb["shared"]["availability"]:
-                    found_list_key = None
-                    max_len = enb["shared"].get("max_shared", 0)
-                    for grouped_nest_key, grouped_nest_list in enb["shared"]["sharing_list"].items():
-                        if len(grouped_nest_list) < max_len or not max_len:
-                            found_list_key = grouped_nest_key
-                            grouped_nest_list.append(nest["_id"])
-                            sharing_list = mongoUtils.get("sharing_lists", found_list_key)
-                            sharing_list["nest_list"].append(nest["_id"])
-                            mongoUtils.update("sharing_lists", found_list_key, sharing_list)
-                            break
-                    if not found_list_key:
-                        found_list_key = str(uuid.uuid4())
-                        enb["shared"]["sharing_list"][found_list_key] = [nest["_id"]]
-                        data = {
-                            "_id": found_list_key,
-                            "nest_list": [nest["_id"]],
-                            "nsd_list": {},
-                            "ns_list": [],
-                        }
-                        mongoUtils.add("sharing_lists", data)
-                    nest["shared"]["radio"] = nest["shared"].get("radio", {})
-                    nest["shared"]["radio"][enb["_id"]] = found_list_key
-                connections.append({"core": epc, "radio": enb})
-                enb["tenants"].append(nest["_id"])
-                mongoUtils.update("func", enb["_id"], enb)
-                functions_list.append(enb["_id"])
-        if not epc or not connections:
-            missing_locations = ", ".join(not_supp_loc) if not_supp_loc else "no supported coverage locations"
-            return f"Error: Not available Radio Network Functions: required gen={gen}, func=1, locations={missing_locations}", 400
-        epc["tenants"].append(nest["_id"])
-        mongoUtils.update("func", epc["_id"], epc)
-        functions_list.append(epc["_id"])
-        for location in not_supp_loc:
-            logger.warning(f"Location {location} not supported")
-            req_slice_des["coverage"].remove(location)
+                missing_locations = ", ".join(not_supp_loc) if not_supp_loc else "no supported coverage locations"
+                return f"Error: Not available Radio Network Functions: required gen={gen}, func=1, locations={missing_locations}", 400
+        else:
+            epc["tenants"].append(nest["_id"])
+            mongoUtils.update("func", epc["_id"], epc)
+            functions_list.append(epc["_id"])
+        if not using_explicit_ns_mapping:
+            for location in not_supp_loc:
+                logger.warning(f"Location {location} not supported")
+                req_slice_des["coverage"].remove(location)
     else:
         # URLLC
         nest["sst"] = 2
         connections = []
         not_supp_loc = []
         missing_functions = []
+        using_explicit_ns_mapping = False
         for location in req_slice_des["coverage"]:
             epc = mongoUtils.find("func", calc_find_data(gen, location.lower(), 0))
             enb = mongoUtils.find("func", calc_find_data(gen, location.lower(), 1))
@@ -329,11 +354,16 @@ def nest_mapping(req):
                 mongoUtils.update("func", epc["_id"], epc)
                 functions_list.extend([epc["_id"], enb["_id"]])
         if not connections:
-            missing_details = "; ".join(missing_functions) if missing_functions else "no supported coverage locations"
-            return f"Error: Not available Network Functions: missing {missing_details}", 400
-        for location in not_supp_loc:
-            logger.warning(f"Location {location} not supported")
-            req_slice_des["coverage"].remove(location)
+            if requested_ns_list:
+                using_explicit_ns_mapping = True
+                logger.warning("URLLC function mapping not found; using explicit service_descriptor.ns_list")
+            else:
+                missing_details = "; ".join(missing_functions) if missing_functions else "no supported coverage locations"
+                return f"Error: Not available Network Functions: missing {missing_details}", 400
+        if not using_explicit_ns_mapping:
+            for location in not_supp_loc:
+                logger.warning(f"Location {location} not supported")
+                req_slice_des["coverage"].remove(location)
 
     nest["connections"] = connections
     nest["functions"] = functions_list

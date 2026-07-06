@@ -119,8 +119,22 @@ def ns_details(
 
         # C) ****** Get the VIM info ******
         new_ns["vims"] = []
-        loc = new_ns["placement_loc"]["location"]
-        get_vim = list(mongoUtils.find_all("vim", {"location": loc}))
+        requested_vim_id = new_ns.get("vim-id") or new_ns.get("vim_id")
+        if requested_vim_id:
+            requested_vim = mongoUtils.find("vim", {"id": requested_vim_id})
+            if not requested_vim:
+                if not new_ns.get("optional", False):
+                    error_message = f"VIM {requested_vim_id} not found"
+                    logger.error(error_message)
+                    return error_message, []
+                pop_list.append(ns)
+                continue
+            loc = requested_vim["location"]
+            new_ns["placement_loc"] = {"location": loc}
+            get_vim = [requested_vim]
+        else:
+            loc = new_ns["placement_loc"]["location"]
+            get_vim = list(mongoUtils.find_all("vim", {"location": loc}))
         if not get_vim:
             if not new_ns.get("optional", False):
                 # Error handling: There is no VIM at that location
