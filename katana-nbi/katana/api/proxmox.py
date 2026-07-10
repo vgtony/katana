@@ -285,6 +285,8 @@ class ProxmoxView(FlaskView):
         cluster_status = client.cluster_status()
         datacenters = self._datacenter_choices(config, version, cluster_status)
         selected_datacenter = self._selected_datacenter(config, datacenters)
+        if not selected_datacenter and len(datacenters) == 1:
+            selected_datacenter = datacenters[0]
         nodes = []
         if selected_datacenter:
             nodes = [
