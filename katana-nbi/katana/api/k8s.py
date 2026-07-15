@@ -14,6 +14,7 @@ import requests  # type: ignore
 
 from katana.shared_utils.mongoUtils import mongoUtils
 from katana.shared_utils.nfvoUtils import osmUtils
+from katana.shared_utils.infrastructureUtils import InfrastructureError, ensure_infrastructure
 
 # Logging Parameters
 logger = logging.getLogger(__name__)
@@ -136,6 +137,18 @@ class K8SClusterView(FlaskView):
         Add a new Kubernetes cluster and register it with OSM, or handle a YAML file upload.
         """
         try:
+            if request.is_json and request.json.get("id") and request.json.get("location"):
+                try:
+                    registered, created = ensure_infrastructure(request.json)
+                except InfrastructureError as exc:
+                    return jsonify({"error": str(exc)}), exc.status_code
+                return jsonify(
+                    {
+                        "message": "Kubernetes cluster registered" if created else "Kubernetes cluster reused",
+                        "id": registered["id"],
+                    }
+                ), 201
+
             if request.content_type.startswith("multipart/form-data"):
                 # Handle file upload
                 logger.info("Received a file upload request for Kubernetes credentials.")

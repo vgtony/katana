@@ -2,6 +2,7 @@ import logging
 import logging.handlers
 import uuid
 import json
+import time
 import pymongo
 import requests
 
@@ -18,6 +19,30 @@ stream_handler.setFormatter(stream_formatter)
 logger.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
+
+OSM_REQUEST_ATTEMPTS = 3
+OSM_WRITE_TIMEOUT = 30
+
+
+class OsmAuthenticationError(RuntimeError):
+    """Raised when OSM authentication still fails after bounded retries."""
+
+
+class OsmRequestError(RuntimeError):
+    """Raised when an OSM operation still fails after bounded retries."""
+
+
+def classify_workload_descriptor(descriptor):
+    """Classify an OSM VNFD as a VM, Kubernetes, mixed, or unknown workload."""
+    has_vdu = bool(descriptor.get("vdu"))
+    has_kdu = bool(descriptor.get("kdu"))
+    if has_vdu and has_kdu:
+        return "mixed"
+    if has_kdu:
+        return "kubernetes"
+    if has_vdu:
+        return "openstack"
+    return "unknown"
 
 
 class Osm:
@@ -56,11 +81,30 @@ class Osm:
             + "'}"
         )
         url = f"https://{self.ip}/osm/admin/v1/tokens"
-        response = requests.post(
-            url, headers=headers, data=data, verify=False, timeout=self.timeout
+        for attempt in range(1, OSM_REQUEST_ATTEMPTS + 1):
+            try:
+                response = requests.post(
+                    url, headers=headers, data=data, verify=False, timeout=self.timeout
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                self.token = response_data.get("id") or response_data.get("_id")
+                if not self.token:
+                    raise ValueError("token id is missing")
+                return self.token
+            except (requests.RequestException, ValueError, AttributeError) as exc:
+                self.token = ""
+                logger.warning(
+                    "OSM authentication attempt %s/%s failed (%s)",
+                    attempt,
+                    OSM_REQUEST_ATTEMPTS,
+                    type(exc).__name__,
+                )
+                if attempt < OSM_REQUEST_ATTEMPTS:
+                    time.sleep(attempt)
+        raise OsmAuthenticationError(
+            f"OSM authentication failed after {OSM_REQUEST_ATTEMPTS} attempts"
         )
-        self.token = response.json()["_id"]
-        return self.token
 
     def addVim(self, vimName, vimPassword, vimType, vimUrl, vimUser, secGroup):
         """
@@ -72,19 +116,41 @@ class Osm:
             vim_type: "{3}", vim_url: "{4}", vim_user: "{5}" , config: {6}}}'.format(
             vimName, vimPassword, vimName, vimType, vimUrl, vimUser, secGroup
         )
-        while True:
+        write_timeout = max(self.timeout, OSM_WRITE_TIMEOUT)
+        for attempt in range(1, OSM_REQUEST_ATTEMPTS + 1):
+            if not self.token:
+                self.getToken()
             headers = {
                 "Content-Type": "application/yaml",
                 "Accept": "application/json",
                 "Authorization": f"Bearer {self.token}",
             }
-            response = requests.post(osm_url, headers=headers, data=data, verify=False)
-            if response.status_code != 401:
-                vim_id = response.json()["id"]
-                break
-            else:
-                self.getToken()
-        return vim_id
+            try:
+                response = requests.post(
+                    osm_url,
+                    headers=headers,
+                    data=data,
+                    verify=False,
+                    timeout=write_timeout,
+                )
+                if response.status_code == 401:
+                    self.token = ""
+                    continue
+                response.raise_for_status()
+                response_data = response.json()
+                vim_id = response_data.get("id") or response_data.get("_id")
+                if not vim_id:
+                    raise ValueError("VIM account id is missing")
+                return vim_id
+            except requests.Timeout as exc:
+                raise OsmRequestError(
+                    f"OSM VIM registration timed out after {write_timeout} seconds"
+                ) from exc
+            except (requests.RequestException, ValueError, AttributeError) as exc:
+                raise OsmRequestError("OSM VIM registration failed") from exc
+        raise OsmAuthenticationError(
+            f"OSM authentication failed after {OSM_REQUEST_ATTEMPTS} attempts"
+        )
 
     def instantiateNs(self, nsName, nsdId, vimAccountId):
         """
@@ -96,19 +162,78 @@ class Osm:
         data = "{{ nsName: {0}, nsdId: {1}, vimAccountId: {2} }}".format(
             nsName, nsdId, vimAccountId
         )
-        while True:
+        write_timeout = max(self.timeout, OSM_WRITE_TIMEOUT)
+        for attempt in range(1, OSM_REQUEST_ATTEMPTS + 1):
+            if not self.token:
+                self.getToken()
             headers = {
                 "Content-Type": "application/yaml",
                 "Accept": "application/json",
                 "Authorization": f"Bearer {self.token}",
             }
-            response = requests.post(osm_url, headers=headers, data=data, verify=False)
-            if response.status_code != 401:
-                nsId = response.json()
-                break
-            else:
+            try:
+                response = requests.post(
+                    osm_url,
+                    headers=headers,
+                    data=data,
+                    verify=False,
+                    timeout=write_timeout,
+                )
+                if response.status_code == 401:
+                    self.token = ""
+                    continue
+                response.raise_for_status()
+                response_data = response.json()
+                ns_id = response_data.get("id") or response_data.get("_id")
+                if not ns_id:
+                    raise ValueError("NS instance id is missing")
+                return ns_id
+            except requests.Timeout as exc:
+                raise OsmRequestError(
+                    f"OSM NS instantiation timed out after {write_timeout} seconds"
+                ) from exc
+            except (requests.RequestException, ValueError, AttributeError) as exc:
+                raise OsmRequestError("OSM NS instantiation failed") from exc
+        raise OsmAuthenticationError(
+            f"OSM authentication failed after {OSM_REQUEST_ATTEMPTS} attempts"
+        )
+
+    def addK8sCluster(self, payload):
+        """Register a Kubernetes cluster with OSM and return its response."""
+        url = f"https://{self.ip}/osm/admin/v1/k8sclusters"
+        while True:
+            response = requests.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self.token}",
+                },
+                json=payload,
+                verify=False,
+                timeout=self.timeout,
+            )
+            if response.status_code == 401:
                 self.getToken()
-        return nsId["id"]
+                continue
+            response.raise_for_status()
+            return response.json()
+
+    def deleteK8sCluster(self, cluster_id):
+        """Remove a Kubernetes cluster registration from OSM."""
+        url = f"https://{self.ip}/osm/admin/v1/k8sclusters/{cluster_id}"
+        while True:
+            response = requests.delete(
+                url,
+                headers={"Authorization": f"Bearer {self.token}"},
+                verify=False,
+                timeout=self.timeout,
+            )
+            if response.status_code == 401:
+                self.getToken()
+                continue
+            response.raise_for_status()
+            return
 
     def getNsr(self, nsId):
         """
@@ -162,14 +287,15 @@ class Osm:
                 osm_vnfd_list = response_data
                 for osm_vnfd in osm_vnfd_list:
                     new_vnfd = {}
-                    if all(key in osm_vnfd for key in ("id", "_id", "mgmt-cp", "vdu")):
+                    runtime = classify_workload_descriptor(osm_vnfd)
+                    if all(key in osm_vnfd for key in ("id", "_id")) and runtime != "unknown":
                         new_vnfd["vnfd-id"] = osm_vnfd["_id"]
                         new_vnfd["name"] = osm_vnfd["id"]
                         new_vnfd["flavor"] = {"memory-mb": 0, "vcpu-count": 0, "storage-gb": 0}
                         instances = 0
     
                         # Iterate over VDUs and calculate resources
-                        for vdu in osm_vnfd["vdu"]:
+                        for vdu in osm_vnfd.get("vdu", []):
                             logger.debug("Processing VDU: %s", vdu.get("id"))
     
                             # Extract virtual-compute-desc for CPU and memory
@@ -211,6 +337,7 @@ class Osm:
                         new_vnfd["flavor"]["instances"] = instances
                         logger.debug("Total instances: %d", new_vnfd["flavor"]["instances"])
                         new_vnfd["mgmt"] = osm_vnfd.get("mgmt-cp", "")
+                        new_vnfd["deployment_runtime"] = runtime
                         new_vnfd["nfvo_id"] = self.nfvo_id
                         new_vnfd["_id"] = str(uuid.uuid4())
     
@@ -218,7 +345,9 @@ class Osm:
                             mongoUtils.add("vnfd", new_vnfd)
                             logger.debug("Successfully added VNFD to MongoDB: %s", new_vnfd["name"])
                         except pymongo.errors.DuplicateKeyError:
-                            logger.warning("VNFD with ID %s already exists in MongoDB. Skipping...", new_vnfd["vnfd-id"])
+                            existing = mongoUtils.find("vnfd", {"vnfd-id": new_vnfd["vnfd-id"]})
+                            new_vnfd["_id"] = existing["_id"]
+                            mongoUtils.update("vnfd", existing["_id"], new_vnfd)
                             continue
                 break
             else:
@@ -264,10 +393,16 @@ class Osm:
                         "nfvo_id": self.nfvo_id,
                         "_id": str(uuid.uuid4()),
                     }
+                    runtimes = set()
     
                     # Iterate over VNFDs that are part of the NSD
-                    for osm_vnfd in osm_nsd.get("vnfd-id", []):
-                        vnfd_id = osm_vnfd  # This is the VNFD reference used in the NSD
+                    vnfd_refs = list(osm_nsd.get("vnfd-id", []))
+                    vnfd_refs.extend(
+                        item.get("vnfd-id-ref")
+                        for item in osm_nsd.get("constituent-vnfd", [])
+                        if item.get("vnfd-id-ref")
+                    )
+                    for vnfd_id in vnfd_refs:
                         logger.debug("Found VNFD reference in NSD: %s", vnfd_id)
     
                         # Try to look up the VNFD in MongoDB by both name and id
@@ -279,6 +414,7 @@ class Osm:
                         if reg_vnfd:
                             logger.debug("VNFD found in database: %s", vnfd_id)
                             new_nsd["vnfd_list"].append(reg_vnfd["name"])
+                            runtimes.add(reg_vnfd.get("deployment_runtime", "unknown"))
     
                             # Aggregate resources from VNFD to NSD
                             for key in new_nsd["flavor"]:
@@ -288,6 +424,13 @@ class Osm:
                                     new_nsd["flavor"][key] += reg_vnfd["flavor"][key]
                         else:
                             logger.warning("VNFD with reference '%s' not found in MongoDB. Skipping...", vnfd_id)
+
+                    if "mixed" in runtimes or len(runtimes - {"unknown"}) > 1:
+                        new_nsd["deployment_runtime"] = "mixed"
+                    elif runtimes - {"unknown"}:
+                        new_nsd["deployment_runtime"] = next(iter(runtimes - {"unknown"}))
+                    else:
+                        new_nsd["deployment_runtime"] = "unknown"
     
                     # Log the final aggregated NSD before adding it to the database
                     logger.debug("Final aggregated NSD: %s", json.dumps(new_nsd, indent=2))
@@ -296,16 +439,14 @@ class Osm:
                         mongoUtils.add("nsd", new_nsd)
                         logger.debug("Successfully added NSD to MongoDB: %s", new_nsd["nsd-name"])
                     except pymongo.errors.DuplicateKeyError:
-                        logger.warning("NSD with ID %s already exists in MongoDB. Skipping...", new_nsd["nsd-id"])
+                        existing = mongoUtils.find("nsd", {"nsd-id": new_nsd["nsd-id"]})
+                        new_nsd["_id"] = existing["_id"]
+                        mongoUtils.update("nsd", existing["_id"], new_nsd)
     
                 break
             else:
                 logger.warning("Unauthorized response received. Fetching a new token...")
                 self.getToken()
-    
-        
-
-
     def bootstrapNfvo(self):
         """
         Reads info from NSDs/VNFDs in the NFVO and stores them in MongoDB

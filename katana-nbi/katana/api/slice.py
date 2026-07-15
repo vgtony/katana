@@ -13,6 +13,10 @@ import requests
 import urllib3
 
 from katana.shared_utils.kafkaUtils import kafkaUtils
+from katana.shared_utils.infrastructureUtils import (
+    InfrastructureError,
+    ensure_infrastructure,
+)
 from katana.shared_utils.mongoUtils import mongoUtils
 from katana.slice_mapping import slice_mapping
 
@@ -57,6 +61,12 @@ VM_PANELS = [
     "vm_disk_write_bytes",
     "vm_disk_errors",
 ]
+
+
+def split_infrastructure(data):
+    """Return a credential-free slice request and its optional infrastructure."""
+    clean_data = dict(data)
+    return clean_data, clean_data.pop("infrastructure", None)
 
 
 class SliceView(FlaskView):
@@ -455,6 +465,39 @@ class SliceView(FlaskView):
 
         return None
 
+    def _explicit_deployment_runtime(self, data, required=False):
+        service_descriptor = data.get("service_descriptor") or {}
+        ns_list = service_descriptor.get("ns_list") or []
+        if required and not ns_list:
+            return None, (
+                "Error: service_descriptor.ns_list is required when infrastructure is provided",
+                400,
+            )
+
+        runtimes = set()
+        for ns in ns_list:
+            if not isinstance(ns, dict) or not ns.get("nsd-id"):
+                return None, ("Error: Every network service requires nsd-id", 400)
+            nsd = mongoUtils.find("nsd", {"nsd-id": ns["nsd-id"]})
+            if not nsd:
+                if required:
+                    return None, (f"Error: NSD {ns['nsd-id']} is not registered", 400)
+                continue
+            runtime = nsd.get("deployment_runtime")
+            if runtime in ("mixed", "unknown"):
+                return None, (
+                    f"Error: NSD {ns['nsd-id']} has unsupported {runtime} deployment runtime",
+                    400,
+                )
+            if runtime:
+                runtimes.add(runtime)
+
+        if len(runtimes) > 1:
+            return None, ("Error: A slice cannot mix OpenStack and Kubernetes services", 400)
+        if required and not runtimes:
+            return None, ("Error: Unable to determine the NSD deployment runtime", 400)
+        return next(iter(runtimes), None), None
+
     def index(self):
         """
         Returns a list of slices and their details,
@@ -642,16 +685,63 @@ class SliceView(FlaskView):
         """
         new_uuid = str(uuid.uuid4())
         data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return "Error: Request body must be a JSON object", 400
+        data, infrastructure = split_infrastructure(data)
         data["_id"] = new_uuid
         validation_error = self._validate_slice_payload(data)
         if validation_error:
             return validation_error
+        mapping_validation_error = slice_mapping.validate_nest_request(data)
+        if mapping_validation_error:
+            return mapping_validation_error
+        base_slice_descriptor = data["base_slice_descriptor"]
+        if not base_slice_descriptor.get("base_slice_des_ref"):
+            for field in slice_mapping.REQ_FIELDS:
+                if field not in base_slice_descriptor:
+                    return (
+                        f"Error: Required field base_slice_descriptor.{field} is missing",
+                        400,
+                    )
+
+        deployment_runtime, runtime_error = self._explicit_deployment_runtime(
+            data, required=infrastructure is not None
+        )
+        if runtime_error:
+            return runtime_error
+
+        infrastructure_id = None
+        if infrastructure is not None:
+            if not isinstance(infrastructure, dict):
+                return "Error: Field infrastructure must be a JSON object", 400
+            if str(infrastructure.get("type", "")).lower() != deployment_runtime:
+                return (
+                    f"Error: Infrastructure type does not match NSD runtime {deployment_runtime}",
+                    400,
+                )
+            for ns in (data.get("service_descriptor") or {}).get("ns_list") or []:
+                nsd = mongoUtils.find("nsd", {"nsd-id": ns["nsd-id"]})
+                if nsd.get("nfvo_id") != infrastructure.get("nfvo_id"):
+                    return (
+                        f"Error: Infrastructure NFVO does not own NSD {ns['nsd-id']}",
+                        400,
+                    )
+            try:
+                registered, _ = ensure_infrastructure(infrastructure)
+            except InfrastructureError as exc:
+                return str(exc), exc.status_code
+            infrastructure_id = registered["id"]
 
         # Get the NEST from the Slice Mapping process
         nest, error_code = slice_mapping.nest_mapping(data)
 
         if error_code:
             return nest, error_code
+
+        if deployment_runtime:
+            nest["deployment_runtime"] = deployment_runtime
+        if infrastructure_id:
+            nest["infrastructure_id"] = infrastructure_id
 
         # Send the message to katana-mngr
         producer = kafkaUtils.create_producer()
@@ -691,7 +781,7 @@ class SliceView(FlaskView):
         """
         data = mongoUtils.get("slice", uuid)
         if data:
-            runtime_errors = data["runtime_errors"]
+            runtime_errors = data.get("runtime_errors", {})
             return dumps(runtime_errors), 200
         else:
             return "Slice not found", 404

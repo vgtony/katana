@@ -13,6 +13,7 @@ from flask_classful import FlaskView
 import pymongo
 
 from katana.shared_utils.mongoUtils import mongoUtils
+from katana.shared_utils.infrastructureUtils import InfrastructureError, ensure_infrastructure
 from katana.shared_utils.vimUtils import opennebulaUtils
 from katana.shared_utils.vimUtils import openstackUtils
 
@@ -74,6 +75,13 @@ class VimView(FlaskView):
         Add a new vim. The request must provide the vim details.
         used by: `katana vim add -f [file]`
         """
+        if request.json.get("credentials") is not None:
+            try:
+                registered, _ = ensure_infrastructure(request.json)
+            except InfrastructureError as exc:
+                return str(exc), exc.status_code
+            return registered["_id"], 201
+
         new_uuid = str(uuid.uuid4())
         request.json["_id"] = new_uuid
         request.json["created_at"] = time.time()  # unix epoch

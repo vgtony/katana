@@ -228,6 +228,52 @@ the network function json should look like this
 sudo katana slice add -f slice.json
 ```
 
+Katana can also register missing OpenStack or Kubernetes infrastructure from the
+same slice YAML. The NFVO must already be registered. Credential paths are
+resolved relative to the slice file and are not stored with the slice.
+
+Kubernetes example:
+
+```yaml
+infrastructure:
+  id: edge-k8s-1
+  type: kubernetes
+  location: group0_edge
+  nfvo_id: osm-1
+  credentials_file: ./creds.yaml
+  k8s_version: v1.30.7
+
+base_slice_descriptor:
+  base_slice_des_id: open5gs-slice
+  coverage: [group0_edge]
+  delay_tolerance: true
+  network_DL_throughput:
+    guaranteed: 1500000
+
+service_descriptor:
+  ns_list:
+    - nsd-id: <ID of a KNF/KDU NSD uploaded to OSM>
+      ns-name: open5gs
+      placement: group0_edge
+```
+
+OpenStack uses a standard `clouds.yaml` file:
+
+```yaml
+infrastructure:
+  id: core-openstack-1
+  type: openstack
+  location: core
+  nfvo_id: osm-1
+  credentials_file: ./clouds.yaml
+  cloud: katana
+```
+
+If `infrastructure` is omitted, Katana selects the single compatible registered
+target for the NSD platform, placement location, and NFVO. If no target or more
+than one target matches, slice creation fails explicitly; provide an
+`infrastructure` section to make the choice unambiguous.
+
 the json for the slice should be like this
 ```json
 {

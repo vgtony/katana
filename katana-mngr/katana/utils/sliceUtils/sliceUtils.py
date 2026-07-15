@@ -39,6 +39,8 @@ NEST_KEYS_OBJ = (
     "device_velocity",
     "terminal_density",
     "slice_name",
+    "deployment_runtime",
+    "infrastructure_id",
 )
 
 NEST_KEYS_LIST = (
@@ -64,8 +66,89 @@ def added_ns_vim_account_name(slice_id):
     return f"katana_slice_{slice_id}_added_ns_vim"
 
 
+def fail_slice(nest, message):
+    """Persist a deployment failure so the slice never remains in a transient state."""
+    logger.error("%s %s", nest["_id"], message)
+    nest["status"] = f"Failed - {message}"
+    nest.setdefault("runtime_errors", {})["deployment"] = [message]
+    mongoUtils.update("slice", nest["_id"], nest)
+
+
+def _osm_error_message(exc, fallback):
+    if exc.__class__.__name__ in {"OsmAuthenticationError", "OsmRequestError"}:
+        return str(exc)
+    return fallback
+
+
+def _deployment_target(target_id):
+    target = mongoUtils.find("vim", {"id": target_id})
+    if target:
+        return target
+    return mongoUtils.find("k8sclusters", {"id": target_id})
+
+
+def resolve_deployment_target(ns, location, preferred_target_id=None):
+    """Resolve one infrastructure target for a network service."""
+    nsd = ns["nsd-info"]
+    runtime = nsd.get("deployment_runtime")
+    nfvo_id = nsd.get("nfvo_id")
+    requested_target_id = ns.get("target") or ns.get("vim-id") or ns.get("vim_id")
+
+    if requested_target_id:
+        target = _deployment_target(requested_target_id)
+        if not target:
+            return None, f"Infrastructure {requested_target_id} not found"
+        if runtime in ("openstack", "kubernetes") and target.get("type", "").lower() != runtime:
+            return None, f"Infrastructure {requested_target_id} does not support {runtime}"
+        if target.get("nfvo_id") not in (None, nfvo_id):
+            return None, f"Infrastructure {requested_target_id} belongs to another NFVO"
+        return target, None
+
+    if preferred_target_id:
+        preferred = _deployment_target(preferred_target_id)
+        if preferred and preferred.get("location") == location:
+            if preferred.get("type", "").lower() != runtime:
+                return None, f"Infrastructure {preferred_target_id} does not support {runtime}"
+            if preferred.get("nfvo_id") not in (None, nfvo_id):
+                return None, f"Infrastructure {preferred_target_id} belongs to another NFVO"
+            return preferred, None
+
+    if runtime == "kubernetes":
+        candidates = list(
+            mongoUtils.find_all(
+                "k8sclusters",
+                {"type": "kubernetes", "location": location, "nfvo_id": nfvo_id},
+            )
+        )
+    elif runtime == "openstack":
+        candidates = [
+            target
+            for target in mongoUtils.find_all(
+                "vim", {"type": "openstack", "location": location}
+            )
+            if target.get("nfvo_id") in (None, nfvo_id)
+        ]
+    else:
+        # Preserve placement behavior for descriptors imported before runtime metadata.
+        candidates = list(mongoUtils.find_all("vim", {"location": location}))
+        return (candidates[0], None) if candidates else (None, f"VIM not found in location {location}")
+
+    if not candidates:
+        return None, f"No {runtime} infrastructure found in location {location}"
+    if len(candidates) > 1:
+        ids = ", ".join(sorted(target["id"] for target in candidates))
+        return None, f"Multiple {runtime} infrastructure targets found in location {location}: {ids}"
+    return candidates[0], None
+
+
 def ns_details(
-    ns_list, edge_loc, vim_dict, total_ns_list, shared_function=0, shared_slice_list_key=None,
+    ns_list,
+    edge_loc,
+    vim_dict,
+    total_ns_list,
+    shared_function=0,
+    shared_slice_list_key=None,
+    preferred_target_id=None,
 ):
     """
     Get details for the NS that are part of the slice
@@ -119,35 +202,24 @@ def ns_details(
 
         # C) ****** Get the VIM info ******
         new_ns["vims"] = []
-        requested_vim_id = new_ns.get("vim-id") or new_ns.get("vim_id")
-        if requested_vim_id:
-            requested_vim = mongoUtils.find("vim", {"id": requested_vim_id})
-            if not requested_vim:
-                if not new_ns.get("optional", False):
-                    error_message = f"VIM {requested_vim_id} not found"
-                    logger.error(error_message)
-                    return error_message, []
-                pop_list.append(ns)
-                continue
-            loc = requested_vim["location"]
-            new_ns["placement_loc"] = {"location": loc}
-            get_vim = [requested_vim]
-        else:
-            loc = new_ns["placement_loc"]["location"]
-            get_vim = list(mongoUtils.find_all("vim", {"location": loc}))
-        if not get_vim:
+        loc = new_ns["placement_loc"]["location"]
+        target, target_error = resolve_deployment_target(
+            new_ns, loc, preferred_target_id=preferred_target_id
+        )
+        if target_error:
             if not new_ns.get("optional", False):
-                # Error handling: There is no VIM at that location
-                error_message = f"VIM not found in location {loc}"
-                logger.error(error_message)
-                return error_message, []
+                logger.error(target_error)
+                return target_error, []
             else:
                 # The NS is optional - continue to next
                 pop_list.append(ns)
                 continue
-        # TODO: Check the available resources and select vim
-        # Temporary use the first element
-        selected_vim = get_vim[0]["id"]
+        selected_vim = target["id"]
+        loc = target["location"]
+        new_ns["placement_loc"] = {"location": loc}
+        target_runtime = target.get("type", "").lower()
+        if target_runtime == "opennebula":
+            target_runtime = "legacy"
         if shared_function:
             selected_vim_id = selected_vim + "_s"
         else:
@@ -163,12 +235,19 @@ def ns_details(
                 "nfvo_list": [new_ns["nfvo-id"]],
                 "shared": shared_function,
                 "shared_slice_list_key": shared_slice_list_key,
+                "runtime": target_runtime,
+                "target_id": selected_vim,
             }
-        resources = vim_dict[selected_vim_id].get("resources", {"memory-mb": 0, "vcpu-count": 0, "storage-gb": 0, "instances": 0})
-        for key in resources:
-            resources[key] += nsd["flavor"][key]
+        resources = vim_dict[selected_vim_id].get(
+            "resources",
+            {"memory-mb": 0, "vcpu-count": 0, "storage-gb": 0, "instances": 0},
+        )
+        if target_runtime != "kubernetes":
+            for key in resources:
+                resources[key] += nsd["flavor"][key]
         vim_dict[selected_vim_id]["resources"] = resources
         new_ns["placement_loc"]["vim"] = selected_vim_id
+        new_ns["deployment_runtime"] = target_runtime
         # 0) Create an uuid for the ns
         new_ns["ns-id"] = str(uuid.uuid4())
         total_ns_list.append(new_ns)
@@ -187,6 +266,7 @@ def add_slice(nest_req):
     nest = {
         "_id": nest_req["_id"],
         "status": "Init",
+        "runtime_errors": {},
         "created_at": time.time(),  # unix epoch
         "deployment_time": {
             "Placement_Time": None,
@@ -252,7 +332,15 @@ def add_slice(nest_req):
             except KeyError:
                 pass
             try:
-                err, pop_list = ns_details(connection[key]["ns_list"], connection[key]["location"], vim_dict, total_ns_list, shared_check, shared_slice_list_key,)
+                err, pop_list = ns_details(
+                    connection[key]["ns_list"],
+                    connection[key]["location"],
+                    vim_dict,
+                    total_ns_list,
+                    shared_check,
+                    shared_slice_list_key,
+                    nest.get("infrastructure_id"),
+                )
                 if pop_list:
                     connection[key]["ns_list"] = [x for x in connection[key]["ns_list"] if x not in pop_list]
                 if err:
@@ -267,7 +355,13 @@ def add_slice(nest_req):
 
     # ii) The extra NS of the slice
     for location in nest["coverage"]:
-        err, _ = ns_details(nest["ns_list"], location.lower(), vim_dict, total_ns_list)
+        err, _ = ns_details(
+            nest["ns_list"],
+            location.lower(),
+            vim_dict,
+            total_ns_list,
+            preferred_target_id=nest.get("infrastructure_id"),
+        )
         if err:
             nest["status"] = f"Failed - {err}"
             nest["ns_inst_info"] = {}
@@ -292,10 +386,27 @@ def add_slice(nest_req):
     # *** STEP-2a: Cloud ***
     # *** STEP-2a-i: Create the new tenant/project on the VIM ***
     for num, (vim, vim_info) in enumerate(vim_dict.items()):
-        if vim_info["shared"]:
-            vim_id = vim[:-2]
-        else:
-            vim_id = vim
+        vim_id = vim_info.get("target_id") or (vim[:-2] if vim_info["shared"] else vim)
+        if vim_info.get("runtime") == "kubernetes":
+            target_cluster = mongoUtils.find("k8sclusters", {"id": vim_id})
+            if not target_cluster:
+                nest["status"] = f"Failed - Kubernetes infrastructure {vim_id} not found"
+                mongoUtils.update("slice", nest["_id"], nest)
+                return
+            vim_info["nfvo_vim_account"] = {
+                nfvo_id: target_cluster["vim_account"]
+                for nfvo_id in vim_info["nfvo_list"]
+            }
+            if vim_info["shared"] == 1:
+                sharing_lists = mongoUtils.get(
+                    "sharing_lists", vim_info["shared_slice_list_key"]
+                )
+                sharing_lists["vims"] = sharing_lists.get("vims", {})
+                sharing_lists["vims"][target_cluster["id"]] = vim_info
+                mongoUtils.update(
+                    "sharing_lists", vim_info["shared_slice_list_key"], sharing_lists
+                )
+            continue
         target_vim = mongoUtils.find("vim", {"id": vim_id})
         target_vim_obj = pickle.loads(mongoUtils.find("vim_obj", {"id": vim_id})["obj"])
 
@@ -336,7 +447,13 @@ def add_slice(nest_req):
         for nfvo_id in vim_info["nfvo_list"]:
             target_nfvo = mongoUtils.find("nfvo", {"id": nfvo_id})
             target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": nfvo_id})["obj"])
-            vim_id = target_nfvo_obj.addVim(tenant_project_name, target_vim["password"], target_vim["type"], target_vim["auth_url"], target_vim["username"], config_param,)
+            try:
+                vim_id = target_nfvo_obj.addVim(tenant_project_name, target_vim["password"], target_vim["type"], target_vim["auth_url"], target_vim["username"], config_param,)
+            except Exception as exc:
+                message = _osm_error_message(exc, "OSM VIM registration failed")
+                logger.exception("OSM VIM registration failed")
+                fail_slice(nest, message)
+                return
             vim_info["nfvo_vim_account"] = vim_info.get("nfvo_vim_account", {})
             vim_info["nfvo_vim_account"][nfvo_id] = vim_id
             # Register the tenant to the mongo db
@@ -423,7 +540,14 @@ def add_slice(nest_req):
         target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": ns["nfvo-id"]})["obj"])
         selected_vim = ns["placement_loc"]["vim"]
         nfvo_vim_account = vim_dict[selected_vim]["nfvo_vim_account"][ns["nfvo-id"]]
-        nfvo_inst_ns = target_nfvo_obj.instantiateNs(ns["ns-name"], ns["nsd-id"], nfvo_vim_account)
+        try:
+            nfvo_inst_ns = target_nfvo_obj.instantiateNs(ns["ns-name"], ns["nsd-id"], nfvo_vim_account)
+        except Exception as exc:
+            message = _osm_error_message(exc, "OSM NS instantiation failed")
+            logger.exception("OSM NS instantiation failed")
+            nest["ns_inst_info"] = ns_inst_info
+            fail_slice(nest, message)
+            return
         ns_inst_info[ns["ns-id"]][ns["placement_loc"]["location"]] = {
             "nfvo_inst_ns": nfvo_inst_ns,
             "nfvo-id": ns["nfvo-id"],
@@ -432,6 +556,7 @@ def add_slice(nest_req):
             "nsd-id": ns["nsd-id"],
             "vim": selected_vim,
             "status": "Started",
+            "deployment_runtime": ns.get("deployment_runtime"),
         }
         # Check if this the first slice of a sharing list
         if ns["shared_function"] == 1:
@@ -454,7 +579,14 @@ def add_slice(nest_req):
         target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": ns["nfvo-id"]})["obj"])
         site = ns["placement_loc"]
         nfvo_inst_ns_id = ns_inst_info[ns["ns-id"]][site["location"]]["nfvo_inst_ns"]
-        insr = target_nfvo_obj.getNsr(nfvo_inst_ns_id)
+        try:
+            insr = target_nfvo_obj.getNsr(nfvo_inst_ns_id)
+        except Exception as exc:
+            message = _osm_error_message(exc, "OSM NS status request failed")
+            logger.exception("OSM NS status request failed")
+            nest["ns_inst_info"] = ns_inst_info
+            fail_slice(nest, message)
+            return
         while insr["operational-status"] != "running" or insr["config-status"] != "configured":
             if insr["operational-status"] == "failed":
                 error_message = f"Network Service {ns['nsd-id']} failed to start on NFVO {ns['nfvo-id']}."
@@ -464,14 +596,22 @@ def add_slice(nest_req):
                 mongoUtils.update("slice", nest["_id"], nest)
                 return
             time.sleep(10)
-            insr = target_nfvo_obj.getNsr(nfvo_inst_ns_id)
+            try:
+                insr = target_nfvo_obj.getNsr(nfvo_inst_ns_id)
+            except Exception as exc:
+                message = _osm_error_message(exc, "OSM NS status request failed")
+                logger.exception("OSM NS status request failed")
+                nest["ns_inst_info"] = ns_inst_info
+                fail_slice(nest, message)
+                return
         nest["deployment_time"]["NS_Deployment_Time"][ns["ns-name"]] = format(time.time() - ns["start_time"], ".4f")
         # Get the IPs of the instantiated NS
         vnf_list = []
-        vnfr_id_list = target_nfvo_obj.getVnfrId(insr)
-        for ivnfr_id in vnfr_id_list:
-            vnfr = target_nfvo_obj.getVnfr(ivnfr_id)
-            vnf_list.append(target_nfvo_obj.getIPs(vnfr))
+        if ns.get("deployment_runtime") != "kubernetes":
+            vnfr_id_list = target_nfvo_obj.getVnfrId(insr)
+            for ivnfr_id in vnfr_id_list:
+                vnfr = target_nfvo_obj.getVnfr(ivnfr_id)
+                vnf_list.append(target_nfvo_obj.getIPs(vnfr))
         ns_inst_info[ns["ns-id"]][site["location"]]["vnfr"] = vnf_list
 
     nest["ns_inst_info"] = ns_inst_info
@@ -607,6 +747,8 @@ def add_slice(nest_req):
                 if value.get("shared", False):
                     search_vim_id = search_vim_id[:-2]
                 selected_vim = mongoUtils.find("vim", {"id": search_vim_id})
+                if not selected_vim:
+                    selected_vim = mongoUtils.find("k8sclusters", {"id": search_vim_id})
                 try:
                     vim_monitoring = selected_vim["type"]
                     vim_monitoring_list = infra_targets.get(vim_monitoring, [])
@@ -805,9 +947,12 @@ def delete_slice(slice_id, force=False):
                 continue
         else:
             vim_id = vim
+        if vim_info.get("runtime") == "kubernetes":
+            # The cluster and its OSM backing account are persistent infrastructure.
+            continue
         try:
             # Delete the new tenants from the NFVO
-            for nfvo, vim_account in vim_info["nfvo_vim_account"].items():
+            for nfvo, vim_account in vim_info.get("nfvo_vim_account", {}).items():
                 # Get the NFVO
                 target_nfvo = mongoUtils.find("nfvo", {"id": nfvo})
                 target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": nfvo})["obj"])
