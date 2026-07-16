@@ -33,6 +33,14 @@ logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
 
+def find_first_role(conn, names):
+    for name in names:
+        role = conn.identity.find_role(name)
+        if role:
+            return role
+    return None
+
+
 def timeout(func):
     """
     Wrapper for function, terminate after 5 seconds
@@ -138,15 +146,21 @@ class Openstack:
         """
         Compbines newly created project and user
         """
-        userrole = conn.identity.find_role("user")
-        heatrole = conn.identity.find_role("heat_stack_owner")
-        conn.identity.assign_project_role_to_user(project, user, userrole)
-        conn.identity.assign_project_role_to_user(project, user, heatrole)
+        member_role = find_first_role(conn, ("member", "user", "_member_"))
+        if not member_role:
+            raise RuntimeError("OpenStack member role was not found")
+        conn.identity.assign_project_role_to_user(project, user, member_role)
+
+        heat_role = conn.identity.find_role("heat_stack_owner")
+        if heat_role:
+            conn.identity.assign_project_role_to_user(project, user, heat_role)
         # Add admin user to the project, in order to create the MAC Addresses
         adminrole = conn.identity.find_role("admin")
         admin_user = conn.identity.find_user(vim_admin_user, ignore_missing=False)
-        conn.identity.assign_project_role_to_user(project, admin_user, adminrole)
-        conn.identity.assign_project_role_to_user(project, admin_user, heatrole)
+        if adminrole:
+            conn.identity.assign_project_role_to_user(project, admin_user, adminrole)
+        if heat_role:
+            conn.identity.assign_project_role_to_user(project, admin_user, heat_role)
 
     def create_sec_group(self, conn, name, project):
         """
@@ -269,7 +283,7 @@ class Openstack:
         project = self.create_project(conn, tenant_project_name, tenant_project_description)
 
         # creates the user
-        user = self.create_user(conn, tenant_project_user, "password")
+        user = self.create_user(conn, tenant_project_user, tenant_project_password)
 
         # assigns some needed roles
         self.combine_proj_user(conn, project, user, self.username)

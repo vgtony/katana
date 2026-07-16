@@ -3,6 +3,7 @@ import json
 import logging
 import logging.handlers
 import pickle
+import secrets
 import time
 import uuid
 import os
@@ -66,6 +67,18 @@ def added_ns_vim_account_name(slice_id):
     return f"katana_slice_{slice_id}_added_ns_vim"
 
 
+def slice_tenant_credentials(vim_account_name):
+    return vim_account_name, secrets.token_urlsafe(24)
+
+
+def openstack_vim_config(security_group):
+    return {
+        "security_groups": security_group,
+        "user_domain_id": "default",
+        "project_domain_id": "default",
+    }
+
+
 def fail_slice(nest, message):
     """Persist a deployment failure so the slice never remains in a transient state."""
     logger.error("%s %s", nest["_id"], message)
@@ -87,11 +100,26 @@ def _deployment_target(target_id):
     return mongoUtils.find("k8sclusters", {"id": target_id})
 
 
+def _requested_nfvo_id(ns):
+    return ns.get("nfvo-id") or ns.get("nfvo_id")
+
+
+def _existing_osm_vim_account(ns):
+    return ns.get("osm-vim-account-id") or ns.get("osm_vim_account_id")
+
+
+def _store_initial_slice_record(nest):
+    if mongoUtils.get("slice", nest["_id"]):
+        mongoUtils.update("slice", nest["_id"], nest)
+    else:
+        mongoUtils.add("slice", nest)
+
+
 def resolve_deployment_target(ns, location, preferred_target_id=None):
     """Resolve one infrastructure target for a network service."""
     nsd = ns["nsd-info"]
     runtime = nsd.get("deployment_runtime")
-    nfvo_id = nsd.get("nfvo_id")
+    nfvo_id = _requested_nfvo_id(ns) or nsd.get("nfvo_id")
     requested_target_id = ns.get("target") or ns.get("vim-id") or ns.get("vim_id")
 
     if requested_target_id:
@@ -192,7 +220,7 @@ def ns_details(
                 error_message = f"NSD {new_ns['nsd-id']} not found on any NFVO registered to SM"
                 logger.error(error_message)
                 return error_message, []
-        new_ns["nfvo-id"] = nsd["nfvo_id"]
+        new_ns["nfvo-id"] = _requested_nfvo_id(new_ns) or nsd["nfvo_id"]
         new_ns["nsd-info"] = nsd
         # B) ****** Replace placement value with location info ******
         if type(new_ns["placement"]) is str:
@@ -238,6 +266,32 @@ def ns_details(
                 "runtime": target_runtime,
                 "target_id": selected_vim,
             }
+        existing_vim_account = _existing_osm_vim_account(new_ns)
+        if existing_vim_account:
+            if target_runtime != "openstack":
+                return "An existing OSM VIM account can only target OpenStack", []
+            nfvo_accounts = vim_dict[selected_vim_id].setdefault(
+                "nfvo_vim_account", {}
+            )
+            existing_nfvo_account = nfvo_accounts.get(new_ns["nfvo-id"])
+            if existing_nfvo_account and existing_nfvo_account != existing_vim_account:
+                return (
+                    f"Conflicting OSM VIM accounts for NFVO {new_ns['nfvo-id']}",
+                    [],
+                )
+            other_nfvos = set(vim_dict[selected_vim_id]["nfvo_list"]) - {
+                new_ns["nfvo-id"]
+            }
+            if other_nfvos:
+                return "An existing OSM VIM account cannot be shared across NFVOs", []
+            nfvo_accounts[new_ns["nfvo-id"]] = existing_vim_account
+            vim_dict[selected_vim_id]["persistent_nfvo_vim_account"] = True
+        elif (
+            vim_dict[selected_vim_id].get("persistent_nfvo_vim_account")
+            and new_ns["nfvo-id"]
+            not in vim_dict[selected_vim_id].get("nfvo_vim_account", {})
+        ):
+            return "Every NFVO requires its own existing OSM VIM account", []
         resources = vim_dict[selected_vim_id].get(
             "resources",
             {"memory-mb": 0, "vcpu-count": 0, "storage-gb": 0, "instances": 0},
@@ -277,11 +331,11 @@ def add_slice(nest_req):
             "Slice_Deployment_Time": None,
         },
     }
-    mongoUtils.add("slice", nest)
     for nest_key in NEST_KEYS_OBJ:
         nest[nest_key] = nest_req.get(nest_key, None)
     for nest_key in NEST_KEYS_LIST:
         nest[nest_key] = nest_req.get(nest_key, [])
+    _store_initial_slice_record(nest)
 
     # Check if slice monitoring has been enabled
     monitoring = os.getenv("KATANA_MONITORING", None)
@@ -387,6 +441,12 @@ def add_slice(nest_req):
     # *** STEP-2a-i: Create the new tenant/project on the VIM ***
     for num, (vim, vim_info) in enumerate(vim_dict.items()):
         vim_id = vim_info.get("target_id") or (vim[:-2] if vim_info["shared"] else vim)
+        if vim_info.get("persistent_nfvo_vim_account"):
+            logger.info(
+                "%s Reusing persistent OSM VIM account",
+                nest["_id"],
+            )
+            continue
         if vim_info.get("runtime") == "kubernetes":
             target_cluster = mongoUtils.find("k8sclusters", {"id": vim_id})
             if not target_cluster:
@@ -425,8 +485,9 @@ def add_slice(nest_req):
             continue
         tenant_project_name = vim_account_name
         tenant_project_description = vim_account_name
-        tenant_project_user = vim_account_name
-        tenant_project_password = "password"
+        tenant_project_user, tenant_project_password = slice_tenant_credentials(
+            vim_account_name
+        )
         # If the vim is Openstack type, set quotas
         quotas = vim_info["resources"] if target_vim["type"] == "openstack" or target_vim["type"] == "Openstack" else None
         logger.info(f"{nest['_id']} Status: Provisioning, Quotas: {quotas}")
@@ -438,7 +499,7 @@ def add_slice(nest_req):
         # STEP-2a-ii: Αdd the new VIM tenant to NFVO
         if target_vim["type"] == "openstack":
             # Update the config parameter for the tenant
-            config_param = dict(security_groups=ids["secGroupName"])
+            config_param = openstack_vim_config(ids["secGroupName"])
         elif target_vim["type"] == "opennebula":
             config_param = target_vim["config"]
         else:
@@ -448,7 +509,7 @@ def add_slice(nest_req):
             target_nfvo = mongoUtils.find("nfvo", {"id": nfvo_id})
             target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": nfvo_id})["obj"])
             try:
-                vim_id = target_nfvo_obj.addVim(tenant_project_name, target_vim["password"], target_vim["type"], target_vim["auth_url"], target_vim["username"], config_param,)
+                vim_id = target_nfvo_obj.addVim(tenant_project_name, tenant_project_password, target_vim["type"], target_vim["auth_url"], tenant_project_user, config_param,)
             except Exception as exc:
                 message = _osm_error_message(exc, "OSM VIM registration failed")
                 logger.exception("OSM VIM registration failed")
@@ -590,10 +651,15 @@ def add_slice(nest_req):
         while insr["operational-status"] != "running" or insr["config-status"] != "configured":
             if insr["operational-status"] == "failed":
                 error_message = f"Network Service {ns['nsd-id']} failed to start on NFVO {ns['nfvo-id']}."
+                osm_detail = insr.get("detailed-status") or insr.get(
+                    "errorDescription"
+                )
+                if osm_detail:
+                    error_message += f" OSM detail: {str(osm_detail)[:500]}"
                 logger.error(error_message)
                 nest["ns_inst_info"] = ns_inst_info
-                nest["status"] = f"Failed - {error_message}"
-                mongoUtils.update("slice", nest["_id"], nest)
+                ns_inst_info[ns["ns-id"]][site["location"]]["status"] = "Failed"
+                fail_slice(nest, error_message)
                 return
             time.sleep(10)
             try:
@@ -947,6 +1013,9 @@ def delete_slice(slice_id, force=False):
                 continue
         else:
             vim_id = vim
+        if vim_info.get("persistent_nfvo_vim_account"):
+            # The user supplied this OSM account and its OpenStack project.
+            continue
         if vim_info.get("runtime") == "kubernetes":
             # The cluster and its OSM backing account are persistent infrastructure.
             continue
@@ -1147,6 +1216,8 @@ def update_slice(nest_id, updates):
                         logger.error(error_message)
                         return
                 # Check if a tenant must be added to the new VIM
+                tenant_project_user = None
+                tenant_project_password = None
                 if not nest["vim_list"].get(restart_ns["vim"], None):
                     # Create the new tenant on the VIM
                     nest["vim_list"][restart_ns["vim"]] = {
@@ -1161,8 +1232,9 @@ def update_slice(nest_id, updates):
                     tenant_name = nest["_id"]
                     tenant_project_name = vim_account_name
                     tenant_project_description = vim_account_name
-                    tenant_project_user = vim_account_name
-                    tenant_project_password = "password"
+                    tenant_project_user, tenant_project_password = slice_tenant_credentials(
+                        vim_account_name
+                    )
                     # If the vim is Openstack type, set quotas
                     quotas = nest["vim_list"][restart_ns["vim"]]["resources"] if target_vim["type"] == "openstack" or target_vim["type"] == "Openstack" else None
                     ids = target_vim_obj.create_slice_prerequisites(tenant_project_name, tenant_project_description, tenant_project_user, tenant_project_password, nest["_id"], quotas=quotas,)
@@ -1184,7 +1256,7 @@ def update_slice(nest_id, updates):
                     vim_account_name = added_ns_vim_account_name(nest_id)
                     if target_vim["type"] == "openstack":
                         # Update the config parameter for the tenant
-                        config_param = dict(security_groups=vim_account_name)
+                        config_param = openstack_vim_config(vim_account_name)
                     elif target_vim["type"] == "opennebula":
                         config_param = target_vim["config"]
                     else:
@@ -1192,7 +1264,7 @@ def update_slice(nest_id, updates):
                     target_nfvo = mongoUtils.find("nfvo", {"id": nfvo_id})
                     target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": nfvo_id})["obj"])
                     tenant_project_name = vim_account_name
-                    vim_id = target_nfvo_obj.addVim(tenant_project_name, target_vim["password"], target_vim["type"], target_vim["auth_url"], target_vim["username"], config_param,)
+                    vim_id = target_nfvo_obj.addVim(tenant_project_name, tenant_project_password or target_vim["password"], target_vim["type"], target_vim["auth_url"], tenant_project_user or target_vim["username"], config_param,)
                     nest["vim_list"][restart_ns["vim"]]["nfvo_vim_account"][nfvo_id] = vim_id
                     # Register the tenant to the mongo db
                     target_nfvo["tenants"][nest_id] = target_nfvo["tenants"].get(nest["_id"], [])
@@ -1322,13 +1394,16 @@ def update_slice(nest_id, updates):
             # Create the Tenants if needed
             target_vim = mongoUtils.find("vim", {"id": selected_vim_id})
             target_vim_obj = pickle.loads(mongoUtils.find("vim_obj", {"id": selected_vim_id})["obj"])
+            tenant_project_user = None
+            tenant_project_password = None
             if configure_vim_tenant:
                 vim_account_name = added_ns_vim_account_name(nest_id)
                 tenant_name = nest["_id"]
                 tenant_project_name = vim_account_name
                 tenant_project_description = vim_account_name
-                tenant_project_user = vim_account_name
-                tenant_project_password = "password"
+                tenant_project_user, tenant_project_password = slice_tenant_credentials(
+                    vim_account_name
+                )
                 # If the vim is Openstack type, set quotas
                 quotas = vim_dict[selected_vim_id]["resources"] if target_vim["type"] == "openstack" or target_vim["type"] == "Openstack" else None
                 ids = target_vim_obj.create_slice_prerequisites(tenant_project_name, tenant_project_description, tenant_project_user, tenant_project_password, nest["_id"], quotas=quotas,)
@@ -1342,7 +1417,7 @@ def update_slice(nest_id, updates):
                 vim_account_name = added_ns_vim_account_name(nest_id)
                 if target_vim["type"] == "openstack":
                     # Update the config parameter for the tenant
-                    config_param = dict(security_groups=vim_account_name)
+                    config_param = openstack_vim_config(vim_account_name)
                 elif target_vim["type"] == "opennebula":
                     config_param = target_vim["config"]
                 else:
@@ -1351,7 +1426,7 @@ def update_slice(nest_id, updates):
                     target_nfvo = mongoUtils.find("nfvo", {"id": nfvo_id})
                     target_nfvo_obj = pickle.loads(mongoUtils.find("nfvo_obj", {"id": nfvo_id})["obj"])
                     tenant_project_name = vim_account_name
-                    vim_id = target_nfvo_obj.addVim(tenant_project_name, target_vim["password"], target_vim["type"], target_vim["auth_url"], target_vim["username"], config_param,)
+                    vim_id = target_nfvo_obj.addVim(tenant_project_name, tenant_project_password or target_vim["password"], target_vim["type"], target_vim["auth_url"], tenant_project_user or target_vim["username"], config_param,)
                     vim_dict[selected_vim_id]["nfvo_vim_account"] = vim_dict[selected_vim_id].get("nfvo_vim_account", {})
                     vim_dict[selected_vim_id]["nfvo_vim_account"][nfvo_id] = vim_id
                     # Register the tenant to the mongo db

@@ -69,6 +69,27 @@ def split_infrastructure(data):
     return clean_data, clean_data.pop("infrastructure", None)
 
 
+def queued_slice_record(nest):
+    """Create the immediately readable record returned by asynchronous creation."""
+    record = dict(nest)
+    record.update(
+        {
+            "status": "Queued",
+            "created_at": time.time(),
+            "runtime_errors": {},
+            "deployment_time": {
+                "Placement_Time": None,
+                "Provisioning_Time": None,
+                "WAN_Deployment_Time": None,
+                "NS_Deployment_Time": None,
+                "Radio_Configuration_Time": None,
+                "Slice_Deployment_Time": None,
+            },
+        }
+    )
+    return record
+
+
 class SliceView(FlaskView):
     """
     Returns a list of slices and their details,
@@ -484,6 +505,45 @@ class SliceView(FlaskView):
                     return None, (f"Error: NSD {ns['nsd-id']} is not registered", 400)
                 continue
             runtime = nsd.get("deployment_runtime")
+            requested_nfvo_id = ns.get("nfvo-id") or ns.get("nfvo_id")
+            existing_vim_account = ns.get("osm-vim-account-id") or ns.get(
+                "osm_vim_account_id"
+            )
+            if requested_nfvo_id and not mongoUtils.find(
+                "nfvo", {"id": requested_nfvo_id}
+            ):
+                return None, (
+                    f"Error: NFVO {requested_nfvo_id} is not registered",
+                    400,
+                )
+            if existing_vim_account is not None:
+                if (
+                    not isinstance(existing_vim_account, str)
+                    or not existing_vim_account.strip()
+                ):
+                    return None, ("Error: osm-vim-account-id must be a string", 400)
+                if runtime != "openstack":
+                    return None, (
+                        "Error: osm-vim-account-id can only be used with OpenStack NSDs",
+                        400,
+                    )
+                if not requested_nfvo_id:
+                    return None, (
+                        "Error: nfvo-id is required with osm-vim-account-id",
+                        400,
+                    )
+                target_id = ns.get("target") or ns.get("vim-id") or ns.get("vim_id")
+                if not target_id:
+                    return None, (
+                        "Error: target is required with osm-vim-account-id",
+                        400,
+                    )
+                target = mongoUtils.find("vim", {"id": target_id})
+                if not target or target.get("type", "").lower() != "openstack":
+                    return None, (
+                        f"Error: OpenStack infrastructure {target_id} is not registered",
+                        400,
+                    )
             if runtime in ("mixed", "unknown"):
                 return None, (
                     f"Error: NSD {ns['nsd-id']} has unsupported {runtime} deployment runtime",
@@ -743,10 +803,16 @@ class SliceView(FlaskView):
         if infrastructure_id:
             nest["infrastructure_id"] = infrastructure_id
 
-        # Send the message to katana-mngr
-        producer = kafkaUtils.create_producer()
-        slice_message = {"action": "add", "message": nest}
-        producer.send("slice", value=slice_message)
+        # Store the asynchronous request before returning its UUID so immediate
+        # frontend polling sees Queued instead of a transient 404.
+        mongoUtils.add("slice", queued_slice_record(nest))
+        try:
+            producer = kafkaUtils.create_producer()
+            slice_message = {"action": "add", "message": nest}
+            producer.send("slice", value=slice_message)
+        except Exception:
+            mongoUtils.delete("slice", new_uuid)
+            raise
 
         return new_uuid, 201
 

@@ -21,6 +21,7 @@ logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
 OSM_REQUEST_ATTEMPTS = 3
+OSM_AUTH_TIMEOUT = 20
 OSM_WRITE_TIMEOUT = 30
 
 
@@ -81,10 +82,11 @@ class Osm:
             + "'}"
         )
         url = f"https://{self.ip}/osm/admin/v1/tokens"
+        auth_timeout = max(self.timeout, OSM_AUTH_TIMEOUT)
         for attempt in range(1, OSM_REQUEST_ATTEMPTS + 1):
             try:
                 response = requests.post(
-                    url, headers=headers, data=data, verify=False, timeout=self.timeout
+                    url, headers=headers, data=data, verify=False, timeout=auth_timeout
                 )
                 response.raise_for_status()
                 response_data = response.json()

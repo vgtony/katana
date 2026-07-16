@@ -1,6 +1,7 @@
 import ast
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 import tempfile
@@ -47,6 +48,9 @@ class MongoStub:
             if all(item.get(key) == value for key, value in query.items()):
                 return item
         return None
+
+    def get(self, collection, item_id):
+        return self.find(collection, {"_id": item_id})
 
     def find_all(self, collection, query=None):
         query = query or {}
@@ -140,6 +144,46 @@ class RequestIsolationTests(unittest.TestCase):
         self.assertNotIn("infrastructure", clean)
         self.assertIn("infrastructure", original)
         self.assertEqual(infrastructure["credentials"]["secret"], "value")
+
+
+class AsyncSliceCreationTests(unittest.TestCase):
+    def test_queued_record_is_immediately_readable(self):
+        namespace = load_definitions(
+            "katana-nbi/katana/api/slice.py",
+            {"queued_slice_record"},
+            {"time": time},
+        )
+        nest = {
+            "_id": "slice-1",
+            "slice_name": "frontend-test",
+            "ns_list": [{"nsd-id": "nsd-1"}],
+        }
+
+        record = namespace["queued_slice_record"](nest)
+
+        self.assertEqual(record["status"], "Queued")
+        self.assertEqual(record["slice_name"], "frontend-test")
+        self.assertEqual(record["runtime_errors"], {})
+        self.assertIn("Placement_Time", record["deployment_time"])
+
+    def test_manager_replaces_existing_queued_record(self):
+        mongo = MongoStub(
+            {"slice": [{"_id": "slice-1", "status": "Queued"}]}
+        )
+        namespace = load_definitions(
+            "katana-mngr/katana/utils/sliceUtils/sliceUtils.py",
+            {"_store_initial_slice_record"},
+            {"mongoUtils": mongo},
+        )
+        initial = {
+            "_id": "slice-1",
+            "slice_name": "frontend-test",
+            "status": "Init",
+        }
+
+        namespace["_store_initial_slice_record"](initial)
+
+        self.assertEqual(mongo.collections["slice"], [initial])
 
 
 class InfrastructureReuseTests(unittest.TestCase):
@@ -299,6 +343,7 @@ class OsmAuthenticationRetryTests(unittest.TestCase):
                 "time": self.TimeStub,
                 "logger": self.LoggerStub(),
                 "OSM_REQUEST_ATTEMPTS": 3,
+                "OSM_AUTH_TIMEOUT": 20,
                 "OSM_WRITE_TIMEOUT": 30,
             },
         )
@@ -317,6 +362,9 @@ class OsmAuthenticationRetryTests(unittest.TestCase):
 
         self.assertEqual(osm.getToken(), "token")
         self.assertEqual(requests_stub.calls, 3)
+        self.assertTrue(
+            all(call["timeout"] == 20 for call in requests_stub.call_kwargs)
+        )
 
     def test_authentication_failure_is_explicit_after_three_attempts(self):
         failures = [
@@ -393,11 +441,135 @@ class SliceFailureTests(unittest.TestCase):
         )
 
 
+class OpenStackTenantCredentialTests(unittest.TestCase):
+    def test_slice_credentials_are_unique_and_not_hardcoded(self):
+        namespace = load_definitions(
+            "katana-mngr/katana/utils/sliceUtils/sliceUtils.py",
+            {"slice_tenant_credentials", "openstack_vim_config"},
+            {"secrets": secrets},
+        )
+
+        first = namespace["slice_tenant_credentials"]("slice-project")
+        second = namespace["slice_tenant_credentials"]("slice-project")
+
+        self.assertEqual(first[0], "slice-project")
+        self.assertNotEqual(first[1], "password")
+        self.assertNotEqual(first[1], second[1])
+        self.assertEqual(
+            namespace["openstack_vim_config"]("slice-security-group"),
+            {
+                "security_groups": "slice-security-group",
+                "user_domain_id": "default",
+                "project_domain_id": "default",
+            },
+        )
+
+    def test_openstack_user_receives_supplied_password(self):
+        class OpenstackModuleStub:
+            @staticmethod
+            def connect(**kwargs):
+                return object()
+
+        namespace = load_definitions(
+            "katana-mngr/katana/shared_utils/vimUtils/openstackUtils.py",
+            {"timeout", "Openstack"},
+            {
+                "functools": __import__("functools"),
+                "Process": object,
+                "openstack": OpenstackModuleStub,
+            },
+        )
+        simple_namespace = __import__("types").SimpleNamespace
+        target = namespace["Openstack"].__new__(namespace["Openstack"])
+        target.auth_url = "http://openstack/v3"
+        target.project_name = "admin"
+        target.username = "admin"
+        target.password = "admin-secret"
+        target.user_domain_name = "Default"
+        target.project_domain_name = "default"
+        target.verify = False
+        target.openstack_authorize = lambda conn: None
+        target.create_project = lambda conn, name, description: simple_namespace(
+            name=name
+        )
+        captured = {}
+
+        def create_user(conn, name, password):
+            captured["password"] = password
+            return simple_namespace(name=name)
+
+        target.create_user = create_user
+        target.combine_proj_user = lambda *args: None
+        target.create_sec_group = lambda conn, name, project: simple_namespace(
+            name=name
+        )
+        target.set_quotas = lambda *args: None
+
+        target.create_slice_prerequisites(
+            "slice-project",
+            "description",
+            "slice-user",
+            "generated-secret",
+            "slice-id",
+        )
+
+        self.assertEqual(captured["password"], "generated-secret")
+
+    def test_current_member_role_is_assigned_without_legacy_heat_role(self):
+        class OpenstackModuleStub:
+            pass
+
+        namespace = load_definitions(
+            "katana-mngr/katana/shared_utils/vimUtils/openstackUtils.py",
+            {"find_first_role", "timeout", "Openstack"},
+            {
+                "functools": __import__("functools"),
+                "Process": object,
+                "openstack": OpenstackModuleStub,
+            },
+        )
+        simple_namespace = __import__("types").SimpleNamespace
+        member_role = simple_namespace(name="member")
+        admin_role = simple_namespace(name="admin")
+        admin_user = simple_namespace(name="admin")
+        assignments = []
+
+        class IdentityStub:
+            @staticmethod
+            def find_role(name):
+                return {"member": member_role, "admin": admin_role}.get(name)
+
+            @staticmethod
+            def find_user(name, ignore_missing=False):
+                return admin_user
+
+            @staticmethod
+            def assign_project_role_to_user(project, user, role):
+                assignments.append((user.name, role.name))
+
+        target = namespace["Openstack"].__new__(namespace["Openstack"])
+        target.combine_proj_user(
+            simple_namespace(identity=IdentityStub()),
+            simple_namespace(name="slice-project"),
+            simple_namespace(name="slice-user"),
+            "admin",
+        )
+
+        self.assertEqual(
+            assignments,
+            [("slice-user", "member"), ("admin", "admin")],
+        )
+
+
 class TargetResolutionTests(unittest.TestCase):
     def _resolver(self, collections):
         namespace = load_definitions(
             "katana-mngr/katana/utils/sliceUtils/sliceUtils.py",
-            {"_deployment_target", "resolve_deployment_target"},
+            {
+                "_deployment_target",
+                "_requested_nfvo_id",
+                "resolve_deployment_target",
+            },
             {"mongoUtils": MongoStub(collections)},
         )
         return namespace["resolve_deployment_target"]
@@ -440,6 +612,88 @@ class TargetResolutionTests(unittest.TestCase):
         )
         self.assertEqual(selected["id"], "two")
         self.assertIsNone(error)
+
+    def test_explicit_nfvo_overrides_mutable_nsd_owner(self):
+        target = {
+            "id": "core-openstack",
+            "type": "openstack",
+            "location": "core",
+            "nfvo_id": "osm-selected",
+        }
+        ns = self._ns(runtime="openstack")
+        ns["nfvo-id"] = "osm-selected"
+        ns["target"] = "core-openstack"
+
+        selected, error = self._resolver({"vim": [target]})(ns, "core")
+
+        self.assertIs(selected, target)
+        self.assertIsNone(error)
+
+
+class ExistingOsmVimAccountTests(unittest.TestCase):
+    class LoggerStub:
+        def error(self, *args):
+            pass
+
+    def test_existing_account_is_marked_persistent_for_provisioning(self):
+        nsd = {
+            "nsd-id": "nsd-1",
+            "nfvo_id": "osm-bootstrap-owner",
+            "deployment_runtime": "openstack",
+            "flavor": {
+                "memory-mb": 1,
+                "vcpu-count": 1,
+                "storage-gb": 1,
+                "instances": 1,
+            },
+        }
+        target = {
+            "id": "core-openstack",
+            "type": "openstack",
+            "location": "core",
+        }
+        namespace = load_definitions(
+            "katana-mngr/katana/utils/sliceUtils/sliceUtils.py",
+            {
+                "_deployment_target",
+                "_requested_nfvo_id",
+                "_existing_osm_vim_account",
+                "resolve_deployment_target",
+                "ns_details",
+            },
+            {
+                "mongoUtils": MongoStub({"nsd": [nsd], "vim": [target]}),
+                "copy": __import__("copy"),
+                "uuid": uuid,
+                "logger": self.LoggerStub(),
+            },
+        )
+        vim_dict = {}
+        total_ns_list = []
+
+        error, _ = namespace["ns_details"](
+            [
+                {
+                    "nsd-id": "nsd-1",
+                    "ns-name": "new-ns",
+                    "placement": "core",
+                    "target": "core-openstack",
+                    "nfvo-id": "osm-selected",
+                    "osm-vim-account-id": "account-1",
+                }
+            ],
+            "core",
+            vim_dict,
+            total_ns_list,
+        )
+
+        self.assertEqual(error, 0)
+        self.assertTrue(vim_dict["core-openstack"]["persistent_nfvo_vim_account"])
+        self.assertEqual(
+            vim_dict["core-openstack"]["nfvo_vim_account"],
+            {"osm-selected": "account-1"},
+        )
+        self.assertEqual(total_ns_list[0]["nfvo-id"], "osm-selected")
 
 
 if __name__ == "__main__":

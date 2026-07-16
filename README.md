@@ -274,6 +274,22 @@ target for the NSD platform, placement location, and NFVO. If no target or more
 than one target matches, slice creation fails explicitly; provide an
 `infrastructure` section to make the choice unambiguous.
 
+To instantiate a new NS through an existing persistent OSM VIM account, pin all
+three identifiers on the NS. Katana reuses the account and its OpenStack project
+and does not delete either when the new slice is removed. The original project
+must remain available while any NS uses that OSM account:
+
+```yaml
+service_descriptor:
+  ns_list:
+    - nsd-id: <existing OSM NSD ID>
+      ns-name: <new NS instance name>
+      nfvo-id: <registered Katana NFVO ID>
+      target: <registered Katana OpenStack infrastructure ID>
+      osm-vim-account-id: <existing OSM VIM account UUID>
+      placement: core
+```
+
 the json for the slice should be like this
 ```json
 {
